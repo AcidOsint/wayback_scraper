@@ -1,0 +1,27 @@
+# Local Wayback archives and generated data
+downloads/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Temporary downloads
+*.part
+
+# Logs
+*.log
+
+# Local IDE settings
+.vscode/
+.idea/
+
+# Virtual environments
+.venv/
+venv/
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# Local backups
+*.bak
