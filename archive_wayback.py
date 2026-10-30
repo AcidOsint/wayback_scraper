@@ -1,38 +1,42 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Q2 - Архиватор сайтов из Wayback Machine (Internet Archive)
+Q2 - Wayback Machine Website Archiver (Internet Archive)
 
-Личный OSINT-инструмент. Ключевые особенности:
-  - один архив на домен: повторный запуск НЕ качает заново то, что уже есть,
-    а доливает только новое (режим мониторинга сайта);
-  - файл физически хранится один раз, даже если встречается в 10 снапшотах;
-    в удобных папках лежат жёсткие ссылки на него (место не тратится);
-  - понятная структура: документы отдельно, фото отдельно, свежая версия
-    сайта отдельно, старые версии - по читаемым датам;
-  - отчёты: таймлайн изменений, контакты и соцсети, метаданные документов
-    (автор/организация/программа), удалённые страницы, sitemap/robots;
-  - дашборд: одна HTML-страница, с которой виден весь архив;
-  - обновление существующего архива и консервативный долов сетевых ошибок.
+A personal OSINT tool. Key features:
+  - one archive per domain: reruns do not download existing captures again;
+    they only add new data and recover missing or modified files;
+  - each unique file is stored once, even if it appears in many captures;
+    convenient folders link to the same stored bytes;
+  - a clear structure: documents, photos, the latest site view, and dated versions;
+  - reports: change timeline, contacts and social links, document metadata,
+    removed pages, sitemap/robots findings, and link graph;
+  - a single HTML dashboard provides an overview of the archive;
+  - existing archives can be updated, with cautious retries for network failures.
 
-Запуск: run.bat (двойной клик) либо python archive_wayback.py
+Run with run.bat (double-click) or python archive_wayback.py
 """
 
 import csv
 import hashlib
+import gzip
 import html as html_mod
 import json
 import logging
 import os
 import re
+import shutil
+import sys
 import threading
+import tempfile
 import time
 import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import zlib
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from datetime import datetime
 from html.parser import HTMLParser
 
@@ -43,7 +47,11 @@ REQUEST_TIMEOUT = 30       # секунд ожидания на один фай�
 MAX_RETRIES = 3            # попыток на файл при ошибке сети
 RETRY_DELAY = 2            # секунд между повторами (умножается на номер попытки)
 CDX_PAGE_SIZE = 100000
+CDX_REQUEST_TIMEOUT = 30  # seconds per Wayback CDX request
+CDX_MAX_ATTEMPTS = 2     # initial request + one retry, only for transient errors
+CDX_RETRY_DELAY = 3      # seconds; keep search retries short and bounded
 MAX_FILE_BYTES = 2 * 1024 * 1024 * 1024
+MAX_GZIP_INSPECTION_BYTES = 512 * 1024 * 1024  # bound structural validation against gzip bombs
 REQUEST_PACE_SECONDS = 0.7     # записей за одну страницу CDX-индекса
 MAX_SUBDOMAINS_TO_CHECK = 80   # 0 = без ограничения; для организации с сотнями
                                 # поддоменов стоит поднять, но каждый - лишний запрос
@@ -61,17 +69,17 @@ SUBDOMAIN_CANDIDATES = [
 # =====================================================
 
 # --- имена папок и служебных файлов ---
-DIR_REPORTS = "00_ОТЧЁТЫ"
-DIR_LATEST = "01_САЙТ_СВЕЖИЙ"
-DIR_DOCS = "02_ДОКУМЕНТЫ"
-DIR_PHOTOS = "03_ФОТО"
-DIR_VERSIONS = "04_ВЕРСИИ"
-DIR_STORE = "_хранилище"
+DIR_REPORTS = "00_REPORTS"
+DIR_LATEST = "01_LATEST_SITE"
+DIR_DOCS = "02_DOCUMENTS"
+DIR_PHOTOS = "03_PHOTOS"
+DIR_VERSIONS = "04_VERSIONS"
+DIR_STORE = "_store"
 
-DB_CSV = "_база.csv"
-FAILED_CSV = "_не_скачалось.csv"
-LOG_FILE = "_журнал.log"
-TOOL_VERSION = "2.5.1"
+DB_CSV = "_database.csv"
+FAILED_CSV = "_failed_downloads.csv"
+LOG_FILE = "_q2.log"
+TOOL_VERSION = "2.6.0"
 
 DB_HEADER = ["digest", "original_url", "timestamp", "mimetype", "statuscode",
              "size_bytes", "sha256", "store_path", "first_seen"]
@@ -113,10 +121,10 @@ BANNER_ART = """
 """
 
 MENU = """
-  01 * СКАЧАТЬ / ОБНОВИТЬ АРХИВ САЙТА
-  02 * СОБРАТЬ ОТЧЁТЫ И ДАШБОРД
-  03 * ПРОВЕРИТЬ ЦЕЛОСТНОСТЬ АРХИВА
-  04 * ВЫХОД
+  01 * DOWNLOAD / UPDATE WEBSITE ARCHIVE
+  02 * GENERATE REPORTS AND DASHBOARD
+  03 * VERIFY ARCHIVE INTEGRITY
+  04 * EXIT
 """
 
 
@@ -130,6 +138,91 @@ def print_banner():
     print(RED + BANNER_ART + RESET)
     print(DIM + f"AUTHOR AcidOsint | BUILD personal | VERSION {TOOL_VERSION} | UNIT Q2 TOOLS" + RESET)
     print(DIM + "=" * 60 + RESET)
+
+
+class ConsoleStatus:
+    """A small, dependency-free live status line for long-running operations.
+
+    It animates only on an interactive terminal. When stdout is redirected, it
+    emits a start and finish line instead of writing carriage-return noise.
+    """
+    _SPINNER = "|/-\\"
+
+    def __init__(self, label, detail="", detail_provider=None, interval=0.12):
+        self.label = str(label)
+        self.detail = detail
+        self.detail_provider = detail_provider
+        self.interval = interval
+        self.started = 0.0
+        self._stop = threading.Event()
+        self._thread = None
+        self._lock = threading.Lock()
+        self._interactive = bool(getattr(sys.stdout, "isatty", lambda: False)())
+        self._frames = 0
+
+    def update(self, detail):
+        with self._lock:
+            self.detail = str(detail)
+
+    def _current_detail(self):
+        try:
+            value = self.detail_provider() if self.detail_provider else self.detail
+            return str(value) if value else "working"
+        except Exception:
+            return "working"
+
+    def _draw(self, final=None, elapsed=None):
+        if elapsed is None:
+            elapsed = max(0.0, time.monotonic() - self.started)
+        seconds = int(elapsed)
+        duration = f"{seconds // 60:02d}:{seconds % 60:02d}"
+        detail = self._current_detail()
+        if final:
+            line = f"  [{final}] {self.label} | {duration} | {detail}"
+        else:
+            spinner = self._SPINNER[self._frames % len(self._SPINNER)]
+            line = f"  [{spinner}] {self.label} | {duration} | {detail}"
+            self._frames += 1
+        try:
+            columns = max(40, shutil.get_terminal_size((100, 20)).columns)
+            if len(line) > columns - 1:
+                line = line[:max(10, columns - 4)] + "..."
+        except Exception:
+            pass
+        if self._interactive:
+            if not os.environ.get("NO_COLOR"):
+                color = "\033[92m" if final == "DONE" else ("\033[91m" if final == "FAIL" else "\033[96m")
+                line = color + line + "\033[0m"
+            sys.stdout.write("\r\x1b[2K" + line)
+            sys.stdout.flush()
+        return line
+
+    def _run(self):
+        while not self._stop.wait(self.interval):
+            self._draw()
+
+    def __enter__(self):
+        self.started = time.monotonic()
+        if self._interactive:
+            self._thread = threading.Thread(target=self._run, name="q2-status", daemon=True)
+            self._thread.start()
+        else:
+            print(f"  [..] {self.label} | {self._current_detail()}", flush=True)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+        elapsed = max(0.0, time.monotonic() - self.started)
+        final = "FAIL" if exc_type else "DONE"
+        line = self._draw(final=final, elapsed=elapsed)
+        if self._interactive:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+        else:
+            print(line, flush=True)
+        return False
 
 
 SHUTDOWN = threading.Event()
@@ -172,6 +265,10 @@ class Throttle:
             if candidate > self._pause_until:
                 self._pause_until = candidate
 
+    def remaining(self):
+        with self._lock:
+            return max(0.0, self._pause_until - time.time())
+
 
 THROTTLE = Throttle()
 
@@ -210,6 +307,10 @@ class CircuitBreaker:
         if remaining > 0:
             interruptible_sleep(remaining)
 
+    def remaining(self):
+        with self._lock:
+            return max(0.0, self._open_until - time.time())
+
     def success(self):
         with self._lock:
             self._errors = 0
@@ -220,7 +321,7 @@ class CircuitBreaker:
             if self._errors >= self.threshold:
                 self._open_until = max(self._open_until, time.time() + self.pause)
                 self._errors = 0
-                LOGGER.warning(f"Circuit breaker: пауза {self.pause} сек после серии сетевых ошибок")
+                LOGGER.warning(f"Circuit breaker opened for {self.pause}s after repeated network errors")
 
 
 REQUEST_PACER = RequestPacer()
@@ -277,7 +378,7 @@ def parse_retry_after(header_value, default=30):
         return default
 
 
-def urlopen_throttled(req, timeout, context="запрос"):
+def urlopen_throttled(req, timeout, context="request"):
     """urlopen с общим троттлингом: при 429 ждёт Retry-After (или дефолт)
     и придерживает ВСЕ остальные потоки на это время, не только текущий."""
     THROTTLE.wait_if_needed()
@@ -289,9 +390,7 @@ def urlopen_throttled(req, timeout, context="запрос"):
         if e.code == 429:
             wait = parse_retry_after(e.headers.get("Retry-After"))
             THROTTLE.report_429(wait)
-            print(f"    archive.org просит притормозить (429), жду {wait} сек "
-                  f"(и остальные потоки тоже)...")
-            LOGGER.warning(f"429 на {context}: жду {wait}с")
+            LOGGER.warning(f"Archive.org rate-limited {context} (HTTP 429); shared cooldown: {wait}s")
         if e.code in (502, 503, 504):
             CIRCUIT_BREAKER.failure()
         raise
@@ -323,7 +422,35 @@ def normalize_url(raw: str) -> str:
 
 
 def get_domain(url: str) -> str:
-    return urllib.parse.urlsplit(url).netloc.lower()
+    """Return a canonical host: omit the scheme's default port (80/443)."""
+    parsed = urllib.parse.urlsplit(url)
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if not host:
+        return parsed.netloc.lower()
+    try:
+        port = parsed.port
+    except ValueError:
+        return parsed.netloc.lower()
+    if (parsed.scheme.lower() == "http" and port == 80) or (parsed.scheme.lower() == "https" and port == 443):
+        port = None
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    return f"{host}:{port}" if port is not None else host
+
+
+def _scope_host_key(netloc: str):
+    """Compare manifest hosts against DB hosts where default ports may differ."""
+    parsed = urllib.parse.urlsplit("//" + str(netloc).strip())
+    host = (parsed.hostname or "").lower().rstrip(".")
+    try:
+        port = parsed.port
+    except ValueError:
+        return str(netloc).lower()
+    # The manifest's path scope is scheme-less; treat explicit standard ports
+    # as equivalent while matching it to the host recovered from a capture URL.
+    if port in (80, 443):
+        port = None
+    return (host, port)
 
 
 def human_size(num_bytes) -> str:
@@ -331,11 +458,11 @@ def human_size(num_bytes) -> str:
         num_bytes = float(num_bytes)
     except (TypeError, ValueError):
         return "?"
-    for unit in ["Б", "КБ", "МБ", "ГБ"]:
+    for unit in ["B", "KB", "MB", "GB"]:
         if num_bytes < 1024.0:
             return f"{num_bytes:.1f} {unit}"
         num_bytes /= 1024.0
-    return f"{num_bytes:.1f} ТБ"
+    return f"{num_bytes:.1f} TB"
 
 
 def pretty_ts(ts: str) -> str:
@@ -380,16 +507,66 @@ def setup_logger(domain_dir: str) -> str:
     return log_path
 
 
-def derived_file_matches_store(store_file, derived_file, digest, expected_sha256=""):
-    """Проверяет производный НЕ-HTML файл против canonical store."""
+def _has_gzip_signature(path):
+    try:
+        with open(path, "rb") as f:
+            return f.read(2) == b"\x1f\x8b"
+    except OSError:
+        return False
+
+
+def _gzip_payload_needs_decoding(path, original_url="", mimetype=""):
+    """True when Wayback stored a gzip-wrapped representation, not a .gz asset."""
+    if not _has_gzip_signature(path):
+        return False
+    ext = get_extension(original_url).lower() if original_url else ""
+    mime = (mimetype or "").split(";", 1)[0].strip().lower()
+    if ext in {"gz", "gzip", "tgz", "svgz"}:
+        return False
+    if mime in {"application/gzip", "application/x-gzip", "application/gzipped"}:
+        return False
+    return True
+
+
+def _sha256_and_size_decoded_gzip(path, max_bytes=MAX_FILE_BYTES):
+    h = hashlib.sha256()
+    size = 0
+    with gzip.open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(256 * 1024), b""):
+            size += len(chunk)
+            if size > max_bytes:
+                raise ValueError(f"decompressed payload exceeds {human_size(max_bytes)}")
+            h.update(chunk)
+    return h.hexdigest(), size
+
+
+def read_store_content(path, original_url="", mimetype="", max_bytes=MAX_FILE_BYTES):
+    """Read content for analysis, transparently decoding gzip wrappers when appropriate."""
+    opener = gzip.open if _gzip_payload_needs_decoding(path, original_url, mimetype) else open
+    chunks = []
+    size = 0
+    with opener(path, "rb") as f:
+        for chunk in iter(lambda: f.read(256 * 1024), b""):
+            size += len(chunk)
+            if size > max_bytes:
+                raise ValueError(f"content exceeds {human_size(max_bytes)}")
+            chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def derived_file_matches_store(store_file, derived_file, digest, expected_sha256="",
+                               original_url="", mimetype=""):
+    """Compare a derived view with store bytes, accounting for gzip-wrapped payloads."""
     if not os.path.isfile(store_file) or not os.path.isfile(derived_file):
         return False
+    decode_gzip = _gzip_payload_needs_decoding(store_file, original_url, mimetype)
     try:
-        if os.path.samefile(store_file, derived_file):
+        if not decode_gzip and os.path.samefile(store_file, derived_file):
             return True
-    except OSError:
-        pass
-    try:
+        if decode_gzip:
+            store_sha, store_size = _sha256_and_size_decoded_gzip(store_file)
+            derived_sha, derived_size = _sha256_and_size(derived_file)
+            return store_size == derived_size and store_sha == derived_sha
         if os.path.getsize(store_file) != os.path.getsize(derived_file):
             return False
         if expected_sha256:
@@ -397,8 +574,18 @@ def derived_file_matches_store(store_file, derived_file, digest, expected_sha256
         store_sha, _ = _sha256_and_size(store_file)
         derived_sha, _ = _sha256_and_size(derived_file)
         return store_sha == derived_sha
-    except OSError:
+    except (OSError, EOFError, gzip.BadGzipFile, ValueError):
         return False
+
+
+def write_view_file(src, dst, original_url="", mimetype="", mutable=False):
+    """Create a user-facing view; canonical store bytes are never modified."""
+    if _gzip_payload_needs_decoding(src, original_url, mimetype):
+        atomic_gzip_decompress(src, dst)
+    elif mutable:
+        atomic_copy_file(src, dst)
+    else:
+        link_or_copy(src, dst)
 
 
 def link_or_copy(src: str, dst: str):
@@ -411,9 +598,9 @@ def link_or_copy(src: str, dst: str):
         return
     except (OSError, AttributeError) as e:
         if not _LINK_WARNED["done"]:
-            print("  (жёсткие ссылки недоступны на этом диске — файлы будут "
-                  "копироваться, архив займёт больше места)")
-            LOGGER.warning(f"Жёсткие ссылки недоступны: {e}")
+            print("  (hard links are unavailable on this drive — files will be "
+                  "copied instead, so the archive will use more disk space)")
+            LOGGER.warning(f"Hard links unavailable: {e}")
             _LINK_WARNED["done"] = True
     with open(src, "rb") as fs, open(dst, "wb") as fd:
         for chunk in iter(lambda: fs.read(1024 * 1024), b""):
@@ -432,7 +619,7 @@ def ensure_parent_dir(filepath: str):
         current = os.path.join(current, seg)
         if os.path.isfile(current):
             try:
-                os.rename(current, current + "__страница")
+                os.rename(current, current + "__page")
             except OSError:
                 pass
         os.makedirs(current, exist_ok=True)
@@ -443,23 +630,23 @@ def domain_dir_for(domain: str) -> str:
 
 
 def ask_domain_dir():
-    raw = input("Адрес сайта или путь к папке архива: ").strip().strip('"')
+    raw = input("Website URL or archive folder path: ").strip().strip('"')
     if os.path.isdir(raw) and os.path.isfile(os.path.join(raw, DB_CSV)):
         return raw
     domain = get_domain(normalize_url(raw))
     if not domain:
-        print("Не понял адрес сайта.")
+        print("Could not interpret the website address.")
         return None
     path = domain_dir_for(domain)
     if not os.path.isdir(path):
-        print(f"Архив для этого сайта ещё не создан: {path}")
-        print("Сначала скачайте сайт (пункт 01).")
+        print(f"No archive exists for this website yet: {path}")
+        print("Download a website first (option 01).")
         return None
     return path
 
 
 def domain_from_archive_db(domain_dir):
-    """Возвращает настоящий домен сайта из первой пригодной строки _база.csv.
+    """Возвращает настоящий домен сайта из первой пригодной строки _database.csv.
 
     Это нужно именно для резервных/тестовых копий архива: папка может называться
     например "www.smartenergo.net — копия", но CDX-запросы всё равно должны идти
@@ -479,62 +666,131 @@ def domain_from_archive_db(domain_dir):
                 if domain:
                     return domain
     except (OSError, csv.Error) as e:
-        LOGGER.warning(f"Не удалось определить домен из {path}: {e}")
+        LOGGER.warning(f"Could not determine website host from {path}: {e}")
     return None
 
 
 def _looks_like_local_path(raw):
-    """Не даём опечатанному Windows-пути случайно превратиться в домен."""
+    """Recognize likely filesystem paths without rejecting scheme-less URLs."""
     text = raw.strip().strip('"')
+    if not text:
+        return False
+    if re.match(r"^https?://", text, re.IGNORECASE):
+        return False
     if re.match(r"^[A-Za-z]:[\\/]", text):
         return True
     if text.startswith(("\\\\", "./", "../", ".\\", "..\\")):
         return True
-    if "\\" in text or "/" in text:
-        # URL уже не считаем локальным путём. Всё остальное с разделителем
-        # пути гораздо вероятнее является ошибочным локальным вводом.
-        return not re.match(r"^https?://", text, re.IGNORECASE)
+    if "\\" in text:
+        return True
+    if "/" in text:
+        # Accept input such as example.com/archive/page without requiring a scheme.
+        first = text.split("/", 1)[0]
+        host_like = bool(re.fullmatch(
+            r"(?:[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?)(?::[0-9]{1,5})?", first))
+        if host_like and ("." in first.split(":", 1)[0] or first.startswith("localhost")):
+            return False
+        # Absolute POSIX paths and ordinary relative paths are filesystem paths.
+        return True
     return False
 
 
 def ask_download_target():
-    """Выбирает рабочий архив для пункта 01.
+    """Choose the archive and retain a non-root URL path as the search scope.
 
-    Можно ввести домен/URL или существующую папку архива. Если ввод явно
-    похож на локальный путь, но такой папки нет, программа НЕ отправляет его
-    в Wayback как будто это домен — это защищает от тихой ошибки в пути.
+    A bare host/root URL keeps the legacy full-domain behavior. An explicit
+    path (for example github.com/AcidOsint) is searched as that URL/path only.
+    Existing archive-folder input always means "update this host archive".
     """
-    raw = input("Адрес сайта ИЛИ путь к папке архива: ").strip().strip('"')
+    raw = input("Website URL OR archive folder path: ").strip().strip('"')
     if not raw:
-        return None, None
+        return None, None, None
 
     if os.path.isdir(raw):
         db_path = os.path.join(raw, DB_CSV)
         if os.path.isfile(db_path):
             domain = domain_from_archive_db(raw)
             if not domain:
-                print("В этой папке есть _база.csv, но не удалось определить домен.")
-                return None, None
+                print("This folder contains _database.csv, but the website host could not be determined.")
+                return None, None, None
             path = os.path.abspath(raw)
-            print(f"  Тест/обновление существующего архива: {path}")
-            print(f"  Домен для Wayback: {domain}")
-            return domain, path
-        print("Это папка, но в ней нет _база.csv — не похоже на архив Q2.")
-        return None, None
+            target_url = None
+            manifest_path = os.path.join(path, "MANIFEST.json")
+            try:
+                with open(manifest_path, encoding="utf-8") as manifest_file:
+                    saved_manifest = json.load(manifest_file)
+                if isinstance(saved_manifest, dict):
+                    saved_scope = saved_manifest.get("search_scope", {})
+                    if isinstance(saved_scope, dict) and saved_scope.get("type") == "path":
+                        candidate = str(saved_scope.get("url") or "").strip()
+                        parsed_candidate = urllib.parse.urlsplit("http://" + candidate)
+                        if (parsed_candidate.hostname
+                                and _scope_host_key(parsed_candidate.netloc) == _scope_host_key(domain)
+                                and (parsed_candidate.path not in ("", "/") or parsed_candidate.query)):
+                            target_url = candidate
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                # Older or damaged manifests retain the legacy full-host behavior.
+                pass
+            print(f"  Updating existing archive: {path}")
+            if target_url:
+                print(f"  Saved search scope: URL path only ({target_url})")
+            else:
+                print(f"  Website host: {domain} (full-host update)")
+            return domain, path, target_url
+        if os.path.isfile(os.path.join(raw, "_база.csv")):
+            print("This is a legacy Russian-layout Q2 archive.")
+            print("This build uses the English layout and does not migrate legacy archives.")
+            print("Keep it aside and start a fresh archive with the website URL.")
+        else:
+            print("This folder has no _database.csv file and does not look like a Q2 archive.")
+        return None, None, None
 
     if _looks_like_local_path(raw):
-        print(f"Локальная папка не найдена:\n  {raw}")
-        print("Проверьте путь. Я не буду отправлять его в Wayback как адрес сайта.")
-        return None, None
+        print(f"Local folder not found:\n  {raw}")
+        print("Check the path. It will not be sent to Wayback as a website address.")
+        return None, None, None
 
-    domain = get_domain(normalize_url(raw))
-    if not domain:
-        print("Не понял адрес сайта.")
-        return None, None
+    normalized = normalize_url(raw)
+    try:
+        parts = urllib.parse.urlsplit(normalized)
+        if parts.scheme.lower() not in ("http", "https") or not parts.hostname:
+            raise ValueError("missing HTTP(S) host")
+        if parts.username or parts.password:
+            raise ValueError("URLs containing credentials are not supported")
+        domain = get_domain(normalized)
+        if not domain:
+            raise ValueError("missing host")
+    except (ValueError, urllib.parse.Error) as e:
+        print(f"Could not interpret the website address: {e}")
+        return None, None, None
 
-    path = domain_dir_for(domain)
-    os.makedirs(path, exist_ok=True)
-    return domain, path
+    path_part = parts.path or "/"
+    has_scope = path_part not in ("", "/") or bool(parts.query)
+    target_url = None
+    if has_scope:
+        # CDX's documented examples use a URL without the scheme. The query
+        # string is retained for exact matching; fragments are never sent.
+        target_url = domain + path_part
+        if parts.query:
+            target_url += "?" + parts.query
+
+    archive_dir = domain_dir_for(domain)
+    legacy_db = os.path.join(archive_dir, "_база.csv")
+    current_db = os.path.join(archive_dir, DB_CSV)
+    if os.path.isdir(archive_dir) and os.path.isfile(legacy_db) and not os.path.isfile(current_db):
+        print("This domain already has a legacy Russian-layout archive:")
+        print(f"  {archive_dir}")
+        print("To start a fresh English-layout archive, move or rename that folder first.")
+        print("The old archive will not be migrated or mixed with the new layout.")
+        return None, None, None
+    os.makedirs(archive_dir, exist_ok=True)
+    if target_url:
+        print(f"  Target URL: {normalized.split('#', 1)[0]}")
+        print(f"  Search scope: URL path only (the full {domain} host will not be scanned)")
+    else:
+        print(f"  Target host: {domain}")
+        print("  Search scope: full domain and its subdomains")
+    return domain, archive_dir, target_url
 
 
 # ==================== CDX (СПИСОК СНАПШОТОВ) ====================
@@ -542,14 +798,21 @@ def ask_download_target():
 CDX_FIELDS = ["original", "timestamp", "digest", "mimetype", "statuscode", "length"]
 
 CDX_MATCH_CHAIN = [
-    ("domain", "весь домен + поддомены (www. и т.п.)"),
-    ("prefix", "весь домен без поддоменов"),
-    ("exact",  "только главная страница"),
+    ("domain", "entire domain and subdomains"),
+    ("host", "primary hostname only"),
+    ("exact", "homepage only"),
 ]
 
 
-def build_cdx_url(domain, date_from, date_to, match_type, resume_key=None):
-    url_value = domain if match_type != "exact" else domain.rstrip("/") + "/"
+def build_cdx_url(domain, date_from, date_to, match_type, resume_key=None, target_url=None):
+    """Build a CDX query. target_url is used only for an explicit URL-path scope."""
+    if match_type == "exact":
+        url_value = target_url if target_url else domain.rstrip("/") + "/"
+    elif match_type == "prefix":
+        url_value = target_url if target_url else domain
+    else:  # host/domain scopes always operate on the hostname, not a URL path
+        url_value = domain
+
     params = {
         "url": url_value,
         "fl": ",".join(CDX_FIELDS),
@@ -569,15 +832,25 @@ def build_cdx_url(domain, date_from, date_to, match_type, resume_key=None):
     return "https://web.archive.org/cdx/search/cdx?" + urllib.parse.urlencode(params)
 
 
-def fetch_cdx_page(cdx_url, timeout=90, raw_sink=None):
+def fetch_cdx_page(cdx_url, timeout=CDX_REQUEST_TIMEOUT, raw_sink=None, status_detail="CDX index request"):
     req = urllib.request.Request(cdx_url, headers=HEADERS)
     lines = []
-    with urlopen_throttled(req, timeout, context="CDX") as resp:
-        for raw_line in resp:
-            lines.append(raw_line.decode("utf-8", errors="replace").rstrip("\r\n"))
+    def live_detail():
+        cooldown = THROTTLE.remaining()
+        if cooldown > 0:
+            return f"RATE LIMITED | retry window ~{max(1, int(cooldown))}s | {status_detail}"
+        circuit_wait = CIRCUIT_BREAKER.remaining()
+        if circuit_wait > 0:
+            return f"SERVICE COOLDOWN ~{max(1, int(circuit_wait))}s | {status_detail}"
+        return status_detail
+
+    with ConsoleStatus("Querying Wayback CDX", detail_provider=live_detail):
+        with urlopen_throttled(req, timeout, context="CDX") as resp:
+            for raw_line in resp:
+                lines.append(raw_line.decode("utf-8", errors="replace").rstrip("\r\n"))
 
     if raw_sink is not None:
-        raw_sink.extend(lines)   # буквально то, что прислал сервер, до всякой обработки
+        raw_sink.extend(lines)  # preserve the server response before parsing
 
     resume_key = None
     if len(lines) >= 2 and lines[-2] == "" and lines[-1].strip():
@@ -585,37 +858,61 @@ def fetch_cdx_page(cdx_url, timeout=90, raw_sink=None):
         lines = lines[:-2]
 
     records = []
+    malformed = []
     for line in lines:
         if not line:
             continue
         parts = line.split(" ")
         if len(parts) != len(CDX_FIELDS):
+            malformed.append(line[:120])
             continue
         records.append(dict(zip(CDX_FIELDS, parts)))
+    # A genuinely empty CDX response means no matches. A non-empty response
+    # with no valid rows may be an upstream error page; don't label it "no data".
+    if lines and any(line.strip() for line in lines) and not records and not resume_key:
+        raise RuntimeError("Wayback CDX returned a non-empty response with no valid capture rows")
     return records, resume_key
 
 
 def classify_error(exc) -> str:
     if isinstance(exc, urllib.error.HTTPError):
         return str(exc.code)
+    if isinstance(exc, (TimeoutError,)):
+        return "TIMEOUT"
+    if isinstance(exc, urllib.error.URLError):
+        reason = getattr(exc, "reason", None)
+        if isinstance(reason, (TimeoutError,)) or "timed out" in str(reason).lower():
+            return "TIMEOUT"
+        return "NETWORK"
+    if isinstance(exc, (ConnectionError, OSError)):
+        if "timed out" in str(exc).lower():
+            return "TIMEOUT"
+        return "NETWORK"
     return type(exc).__name__
+
+
+def is_retryable_cdx_error(exc) -> bool:
+    """Retry only transient failures; a 429 activates the shared cooldown."""
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code in (408, 425, 500, 502, 503, 504)
+    if isinstance(exc, (urllib.error.URLError, TimeoutError, ConnectionError, OSError)):
+        return True
+    return False
 
 
 def diagnose_failure_message(error_codes: list) -> str:
     if not error_codes:
-        return ("Снапшоты не найдены — возможно, этот сайт вообще не попадал в архив, "
-                "либо в указанном диапазоне дат ничего нет.")
-    if all(c == "503" for c in error_codes):
-        return ("Archive.org сейчас НЕ РАБОТАЕТ целиком (ошибка 503 на всех запросах, "
-                "даже на самых лёгких). Это не проблема сайта или скрипта — сервис лежит. "
-                "Попробуйте через 10-30 минут.")
-    if all(c == "504" for c in error_codes):
-        return ("Archive.org не успевает обработать запрос (таймаут 504). Обычно это "
-                "значит, что у сайта слишком большая история. Попробуйте задать более "
-                "узкий диапазон дат.")
-    return (f"Archive.org отвечает нестабильно (коды ошибок: {', '.join(error_codes)}). "
-            f"Похоже на временные проблемы на их стороне — попробуйте позже.")
-
+        return ("No captures found for this URL and date range. The site may never have been archived, "
+                "or there may be no captures in the selected period.")
+    if "503" in error_codes:
+        return ("At least one Wayback CDX request ended with HTTP 503 after its retry policy. "
+                "An earlier attempt may also have timed out. The archive service may be temporarily "
+                "unavailable; the presence of captures could not be determined. Try again later.")
+    if all(c in ("504", "TIMEOUT") for c in error_codes):
+        return ("Wayback CDX requests timed out. The query may be too broad or the index may be slow. "
+                "Try a narrower date range; no conclusion can be drawn about whether captures exist.")
+    return (f"Wayback CDX could not complete the search (error codes: {', '.join(error_codes)}). "
+            "This is a search failure, not proof that the URL has never been archived.")
 
 def save_raw_cdx_page(domain_dir, match_type, page, raw_lines):
     """Сохраняем полученные CDX-строки до разбора (построчно, как он пришёл, включая
@@ -631,65 +928,74 @@ def save_raw_cdx_page(domain_dir, match_type, page, raw_lines):
         with open(path, "w", encoding="utf-8") as f:
             f.write("\n".join(raw_lines))
     except Exception as e:
-        LOGGER.debug(f"Не удалось сохранить сырой CDX: {e}")
+        LOGGER.debug(f"Could not save raw CDX response: {e}")
 
 
-def fetch_cdx_all_pages(domain, date_from, date_to, match_type, domain_dir=None):
+def fetch_cdx_all_pages(domain, date_from, date_to, match_type, domain_dir=None,
+                       target_url=None, status_description=None):
     all_records = []
     resume_key = None
     page = 1
     last_error_code = None
 
     while True:
-        cdx_url = build_cdx_url(domain, date_from, date_to, match_type, resume_key)
+        cdx_url = build_cdx_url(domain, date_from, date_to, match_type, resume_key,
+                                target_url=target_url)
         page_records = None
         next_resume_key = None
         raw_lines = []
-        max_attempts = 2 if page == 1 else 4
+        description = status_description or match_type
+        max_attempts = CDX_MAX_ATTEMPTS
 
         for attempt in range(1, max_attempts + 1):
             try:
                 raw_lines = []
-                page_records, next_resume_key = fetch_cdx_page(cdx_url, raw_sink=raw_lines)
+                page_records, next_resume_key = fetch_cdx_page(
+                    cdx_url, timeout=CDX_REQUEST_TIMEOUT, raw_sink=raw_lines,
+                    status_detail=f"{description} | page {page} | attempt {attempt}/{max_attempts}")
+                last_error_code = None
                 break
+            except KeyboardInterrupt:
+                raise
             except Exception as e:
                 last_error_code = classify_error(e)
-                print(f"    попытка {attempt}/{max_attempts} не удалась ({e}). "
-                      f"Жду {attempt * 10} сек...")
-                LOGGER.warning(f"CDX matchType={match_type} стр.{page} поп.{attempt}: {e}")
-                interruptible_sleep(attempt * 10)
+                LOGGER.warning(f"CDX {match_type} page {page}, attempt {attempt}/{max_attempts}: {e}")
+                if last_error_code == "429":
+                    print("    Wayback rate-limited the query (HTTP 429). Stopping instead of retrying into the cooldown.")
+                    break
+                if attempt >= max_attempts or not is_retryable_cdx_error(e):
+                    print(f"    Request failed ({last_error_code}): {e}")
+                    break
+                delay = CDX_RETRY_DELAY * attempt
+                print(f"    Transient error {last_error_code}; retrying once in {delay}s...")
+                interruptible_sleep(delay)
                 if SHUTDOWN.is_set():
-                    break   # попросили остановиться - не лезем в сеть ещё раз
+                    break
 
         if SHUTDOWN.is_set() and page_records is None:
-            LOGGER.info("CDX: остановлено пользователем во время ретрая")
+            LOGGER.info("CDX retry interrupted by user")
             return all_records, last_error_code
 
         if page_records is None:
             if page == 1:
                 return [], last_error_code
-            print(f"    не удалось скачать страницу {page}, продолжаю с тем, что есть")
-            break
+            print(f"    Could not retrieve page {page}; retaining {len(all_records)} records already received.")
+            return all_records, last_error_code
 
         all_records.extend(page_records)
         save_raw_cdx_page(domain_dir, match_type, page, raw_lines)
-        print(f"    страница {page}: {len(page_records)} записей "
-              f"(всего: {len(all_records)})")
+        print(f"    Page {page}: {len(page_records)} records (running total: {len(all_records)})")
 
         if not next_resume_key:
             break
         if next_resume_key == resume_key:
-            # archive.org иногда отдаёт один и тот же resumeKey раз за разом -
-            # без этой защиты страница качалась бы заново до бесконечности
-            LOGGER.warning("CDX: archive.org вернул повторяющийся resumeKey, "
-                           "останавливаюсь во избежание зацикливания")
-            print("    archive.org вернул повторяющийся ключ страницы - останавливаюсь здесь")
+            LOGGER.warning("CDX returned a repeated resumeKey; stopping to prevent an infinite loop")
+            print("    Wayback returned a repeated page key; stopping to avoid an infinite loop.")
             break
         resume_key = next_resume_key
         page += 1
 
     return all_records, None
-
 
 def fetch_subdomains_from_crtsh(base_domain, timeout=40):
     """crt.sh - открытая база всех выпущенных SSL-сертификатов. Показывает,
@@ -700,8 +1006,8 @@ def fetch_subdomains_from_crtsh(base_domain, timeout=40):
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read().decode("utf-8", errors="replace"))
     except Exception as e:
-        print(f"    crt.sh недоступен ({e}), использую стандартный список")
-        LOGGER.warning(f"crt.sh недоступен для {base_domain}: {e}")
+        print(f"    crt.sh unavailable ({e}); using the built-in list")
+        LOGGER.warning(f"crt.sh unavailable for {base_domain}: {e}")
         return []
 
     names = set()
@@ -715,24 +1021,24 @@ def fetch_subdomains_from_crtsh(base_domain, timeout=40):
                 continue
             names.add(host)
 
-    LOGGER.info(f"crt.sh дал {len(names)} поддоменов для {base_domain}")
+    LOGGER.info(f"crt.sh returned {len(names)} subdomains for {base_domain}")
     return sorted(names)
 
 
 def sweep_subdomains(base_domain, date_from, date_to, existing_keys, domain_dir=None):
-    print("  Ищу реальные поддомены через crt.sh (база SSL-сертификатов)...")
+    print("  Discovering known subdomains via crt.sh (SSL certificate database)...")
     real_subs = fetch_subdomains_from_crtsh(base_domain)
     if real_subs:
-        print(f"    crt.sh нашёл поддоменов: {len(real_subs)}")
+        print(f"    crt.sh found subdomains: {len(real_subs)}")
 
     guessed = [f"{s}.{base_domain}" for s in SUBDOMAIN_CANDIDATES]
     all_candidates = list(dict.fromkeys(real_subs + guessed))
     all_subs = all_candidates if MAX_SUBDOMAINS_TO_CHECK <= 0 else all_candidates[:MAX_SUBDOMAINS_TO_CHECK]
     skipped = len(all_candidates) - len(all_subs)
 
-    msg = f"  Проверяю {len(all_subs)} поддоменов в архиве"
+    msg = f"  Checking {len(all_subs)} subdomains in Wayback"
     if skipped:
-        msg += f" (ещё {skipped} пропущено - см. MAX_SUBDOMAINS_TO_CHECK в настройках)"
+        msg += f" ({skipped} more skipped; see MAX_SUBDOMAINS_TO_CHECK in settings)"
     print(msg + "...")
 
     found = []
@@ -741,14 +1047,14 @@ def sweep_subdomains(base_domain, date_from, date_to, existing_keys, domain_dir=
         try:
             page1_records, resume_key = fetch_cdx_page(cdx_url, timeout=20)
         except Exception as e:
-            LOGGER.debug(f"Поддомен {sub_domain}: недоступен ({e})")
+            LOGGER.debug(f"Subdomain {sub_domain} unavailable ({e})")
             continue
 
         records = page1_records
         if resume_key:
             # у поддомена реально большая история - не бросаем хвост,
             # докачиваем полностью через нормальную пагинацию
-            print(f"    {sub_domain}: большая история, докачиваю все страницы...")
+            print(f"    {sub_domain}: large history; fetching all pages...")
             fuller, _ = fetch_cdx_all_pages(sub_domain, date_from, date_to, "prefix", domain_dir)
             if fuller:
                 records = fuller
@@ -756,15 +1062,15 @@ def sweep_subdomains(base_domain, date_from, date_to, existing_keys, domain_dir=
         new_records = [r for r in records
                        if (r["original"], r["timestamp"]) not in existing_keys]
         if new_records:
-            print(f"    {sub_domain}: +{len(new_records)} файлов")
+            print(f"    {sub_domain}: +{len(new_records)} captures")
             for r in new_records:
                 existing_keys.add((r["original"], r["timestamp"]))
             found.extend(new_records)
     if not found:
-        print("    поддомены ничего не добавили")
+        print("    No new captures found on checked subdomains.")
     if skipped:
-        LOGGER.warning(f"Поддомены: пропущено {skipped} из {len(all_candidates)} "
-                       f"кандидатов (лимит MAX_SUBDOMAINS_TO_CHECK={MAX_SUBDOMAINS_TO_CHECK})")
+        LOGGER.warning(f"Subdomain discovery skipped {skipped} of {len(all_candidates)} "
+                       f"candidates (MAX_SUBDOMAINS_TO_CHECK={MAX_SUBDOMAINS_TO_CHECK})")
     return found, skipped
 
 
@@ -800,62 +1106,122 @@ def discover_wellknown_paths(domain, date_from, date_to, existing_keys):
     return found
 
 
-def fetch_cdx_records(domain, date_from, date_to, domain_dir=None):
-    print(f"Запрашиваю у Wayback Machine список снапшотов для: {domain}")
-    LOGGER.info(f"CDX: старт {domain}, {date_from or '...'}..{date_to or '...'}")
+def fetch_cdx_records(domain, date_from, date_to, domain_dir=None, target_url=None):
+    is_path_scope = bool(target_url)
+    if is_path_scope:
+        parsed_target = urllib.parse.urlsplit("http://" + target_url)
+        target_path = parsed_target.path or "/"
+        query_string = parsed_target.query
+        final_segment = target_path.rstrip("/").rsplit("/", 1)[-1]
+        looks_like_file = bool(os.path.splitext(final_segment)[1])
+        prefix_target = None
+        if not looks_like_file and not query_string:
+            prefix_target = target_url.rstrip("/") + "/"
+        match_chain = [("exact", "exact URL")]
+        if prefix_target:
+            match_chain.append(("prefix", "URL path and descendants"))
+        label = target_url
+        scope_description = "URL path"
+    else:
+        match_chain = CDX_MATCH_CHAIN
+        label = domain
+        scope_description = "full domain and subdomains"
+
+    print(f"\nSearching the Wayback Machine: {label}")
+    print(f"  Scope: {scope_description}")
+    print(f"  Date range: {date_from or 'earliest available'} to {date_to or 'today'}")
+    print(f"  Per-request timeout: {CDX_REQUEST_TIMEOUT}s; at most one retry for transient failures.")
+    LOGGER.info(f"CDX search started: {label}, {date_from or '...'}..{date_to or '...'}")
 
     used_match_type = None
     records = []
     error_codes = []
-    for match_type, description in CDX_MATCH_CHAIN:
-        print(f"  Пробую режим: {description}...")
-        page_records, error_code = fetch_cdx_all_pages(domain, date_from, date_to,
-                                                        match_type, domain_dir)
+    successful_empty_mode = None
+    partial_result = False
+
+    for index, (match_type, description) in enumerate(match_chain):
+        query_target = None
+        if is_path_scope:
+            query_target = target_url if match_type == "exact" else prefix_target
+        print(f"  Query scope: {description}...")
+        page_records, error_code = fetch_cdx_all_pages(
+            domain, date_from, date_to, match_type, domain_dir,
+            target_url=query_target, status_description=description)
+
         if page_records:
-            used_match_type = match_type
-            records = page_records
-            if match_type != "domain":
-                print(f"\n  ВНИМАНИЕ: полный обход домена недоступен, использован "
-                      f"урезанный режим: {description}\n")
+            records.extend(page_records)
+            used_match_type = used_match_type or match_type
+            if error_code:
+                partial_result = True
+                error_codes.append(error_code)
+                print(f"    WARNING: search returned partial results; a later page failed ({error_code}).")
+            if is_path_scope:
+                # Exact URL and directory-prefix are independent scopes; merge both.
+                if error_code:
+                    break
+                continue
             break
+
         if error_code:
             error_codes.append(error_code)
-        print(f"    режим не ответил, пробую более узкий...")
+            is_timeout = error_code in ("504", "TIMEOUT")
+            if (not is_path_scope and is_timeout and match_type in ("domain", "host")
+                    and index + 1 < len(match_chain)):
+                print("    Broad query timed out; trying the next narrower scope.")
+                continue
+            # 503, 429, connection failures and errors on a path-specific query
+            # do not trigger speculative extra requests.
+            print("    Search stopped after the failed request; no extra probes will be sent.")
+            break
 
-    existing = {(r["original"], r["timestamp"]) for r in records}
+        # An empty 200 response is a successful result, not a network failure.
+        successful_empty_mode = match_type
+        print("    Request succeeded but returned no captures for this scope.")
+        if is_path_scope and match_type == "exact" and index + 1 < len(match_chain):
+            continue
+        break
 
-    # После успешного полного domain-CDX отдельный перебор robots/sitemap
-    # почти всегда только добавляет лишние запросы и задержку. Он нужен как
-    # резервный путь, когда полный обход не сработал или был урезан.
-    if not records or used_match_type != "domain":
-        wellknown = discover_wellknown_paths(domain, date_from, date_to, existing)
-        if wellknown:
-            if not records:
-                print(f"  Основной обход не ответил, но по стандартным путям "
-                      f"нашёл {len(wellknown)} файлов (robots/sitemap)")
-            else:
-                print(f"  Найдено ещё по стандартным путям (robots/sitemap): {len(wellknown)}")
-            records.extend(wellknown)
-    elif domain_dir:
-        print("  Полный CDX-обход успешен — robots/sitemap дополнительно не опрашиваю.")
+    # Merge exact/prefix results without counting the same capture twice.
+    deduplicated = {}
+    for row in records:
+        deduplicated.setdefault((row.get("original", ""), row.get("timestamp", "")), row)
+    records = list(deduplicated.values())
 
     if not records:
-        print(diagnose_failure_message(error_codes))
-        LOGGER.error(f"CDX: ни один режим не сработал ({error_codes})")
+        if error_codes and successful_empty_mode:
+            print("\nThe narrower query returned no captures, but another query failed. "
+                  "The overall search is inconclusive; some URLs or subdomains may remain unchecked.")
+            LOGGER.error(f"CDX search inconclusive: errors={error_codes}, empty_mode={successful_empty_mode}")
+        else:
+            print("\n" + diagnose_failure_message(error_codes))
+            if error_codes:
+                LOGGER.error(f"CDX search inconclusive: no records retrieved; request errors={error_codes}")
+            else:
+                LOGGER.info("CDX search completed successfully with no matching captures")
         return [], None
 
-    if used_match_type != "domain":
-        extra, _ = sweep_subdomains(domain, date_from, date_to, existing, domain_dir)
-        if extra:
-            print(f"  Поддомены добавили файлов: {len(extra)}")
-            records.extend(extra)
+    if is_path_scope:
+        if error_codes:
+            print(f"  WARNING: partial path search; {len(records)} captures were found, but one or more CDX queries failed ({', '.join(error_codes)}).")
+        elif len(match_chain) > 1:
+            print(f"  Combined exact URL and path-prefix results: {len(records)} captures.")
+    elif used_match_type != "domain":
+        print(f"\n  WARNING: the full-domain query was unavailable; results use the narrower '{used_match_type}' scope.")
 
-    print(f"Итого найдено уникальных версий файлов: {len(records)}")
-    LOGGER.info(f"CDX: итог {len(records)} записей, режим={used_match_type}")
+    # Extra host/path probes are intentionally not run after an empty response
+    # or a network failure. They add requests without making an unsuccessful
+    # primary query trustworthy. Keep optional discovery for a successful
+    # host-level scan only.
+    if not is_path_scope and used_match_type == "host" and not error_codes:
+        existing = {(r["original"], r["timestamp"]) for r in records}
+        wellknown = discover_wellknown_paths(domain, date_from, date_to, existing)
+        if wellknown:
+            print(f"  Additional standard paths found (robots/sitemap): {len(wellknown)} captures.")
+            records.extend(wellknown)
+
+    print(f"Total captures found: {len(records)}")
+    LOGGER.info(f"CDX result: {len(records)} records, scope={used_match_type}, partial={partial_result}")
     return records, used_match_type
-
-
-# ==================== БАЗА АРХИВА ====================
 
 def dedup_by_digest(rows):
     """Один и тот же физический файл (digest) может встречаться в базе
@@ -914,7 +1280,7 @@ def append_db(domain_dir, new_rows):
             # только поля, без которых невозможно безопасно сопоставить capture.
             required = {"original_url", "timestamp"}
             if not required.issubset(set(header)):
-                LOGGER.warning('В _база.csv отсутствуют обязательные поля original_url/timestamp — обновление отменено')
+                LOGGER.warning('Required fields original_url/timestamp are missing from _database.csv — update cancelled')
                 return
 
             # Простая миграция: приводим существующие строки к текущему
@@ -929,7 +1295,7 @@ def append_db(domain_dir, new_rows):
                         migrated_row.append(old_row[idx] if idx is not None and idx < len(old_row) else "")
                     migrated.append(migrated_row)
                 rows = migrated
-                LOGGER.info('Мигрирован заголовок _база.csv к текущей схеме')
+                LOGGER.info('Migrated _database.csv header to the current schema')
     else:
         rows = [DB_HEADER.copy()]
 
@@ -977,9 +1343,9 @@ def is_permanent_download_failure(reason):
         return True
     text = str(reason).lower()
     permanent_markers = (
-        "sha-1 wayback digest не совпал",
-        "файл больше лимита",
-        "сервер вернул пустой файл",
+        "Wayback SHA-1 digest mismatch",
+        "file exceeds size limit",
+        "server returned an empty file",
         "http error 400", "http error 401", "http error 403",
         "http error 404", "http error 405", "http error 406",
         "http error 410", "http error 412", "http error 413",
@@ -1000,7 +1366,7 @@ def failed_row_is_permanent(row):
     reason = row.get("reason", "")
     if str(reason).lstrip().startswith(PERMANENT_FAILURE_MARKER):
         return True
-    # Совместимость со старыми _не_скачалось.csv, созданными до 2.3.
+    # Совместимость со старыми _failed_downloads.csv, созданными до 2.3.
     return is_permanent_download_failure(reason)
 
 
@@ -1113,7 +1479,7 @@ def cleanup_part_files(domain_dir):
 
 
 def hide_store_folder(domain_dir):
-    """_хранилище - техническая часть (там файлы лежат под именами-хэшами,
+    """_store - техническая часть (там файлы лежат под именами-хэшами,
     без расширений). Помечаем её скрытой в Windows, чтобы не путала - в
     обычных папках (Документы/Фото/Версии) лежат ссылки с нормальными
     именами на эти же файлы."""
@@ -1127,7 +1493,7 @@ def hide_store_folder(domain_dir):
         FILE_ATTRIBUTE_HIDDEN = 0x02
         ctypes.windll.kernel32.SetFileAttributesW(path, FILE_ATTRIBUTE_HIDDEN)
     except Exception as e:
-        LOGGER.debug(f"Не удалось скрыть {path}: {e}")
+        LOGGER.debug(f"Could not hide {path}: {e}")
 
 
 # ==================== ПУТИ ВНУТРИ ВЕРСИИ ====================
@@ -1252,14 +1618,14 @@ def _download_to_store(raw_url, store_file, expected_digest):
                             break
                         size += len(chunk)
                         if size > MAX_FILE_BYTES:
-                            raise ValueError(f"файл больше лимита {human_size(MAX_FILE_BYTES)}")
+                            raise ValueError(f"file exceeds size limit {human_size(MAX_FILE_BYTES)}")
                         h1.update(chunk)
                         h256.update(chunk)
                         f.write(chunk)
                     f.flush()
                     os.fsync(f.fileno())
             if size <= 0:
-                raise ValueError("сервер вернул пустой файл")
+                raise ValueError("server returned an empty file")
             digest_b32 = __import__("base64").b32encode(h1.digest()).decode("ascii").rstrip("=").lower()
             if not str(expected_digest).startswith("local_") and digest_b32 != str(expected_digest).strip().lower():
                 content_type = ""
@@ -1270,7 +1636,7 @@ def _download_to_store(raw_url, store_file, expected_digest):
                 except Exception:
                     pass
                 raise ValueError(
-                    "SHA-1 Wayback digest не совпал — файл отброшен; "
+                    "Wayback SHA-1 digest mismatch — file rejected; "
                     f"expected={str(expected_digest).strip().lower()}, actual={digest_b32}, "
                     f"bytes={size}, Content-Length={content_length or "?"}, Content-Type={content_type or "?"}"
                 )
@@ -1313,7 +1679,7 @@ def _download_to_store(raw_url, store_file, expected_digest):
                 except OSError:
                     pass
     if last_exc is not None and _local_error_is_permanent(last_exc):
-        last_exc = ValueError("[PERMANENT] локальная ошибка файловой системы: " + str(last_exc))
+        last_exc = ValueError("[PERMANENT] local filesystem error: " + str(last_exc))
     return None, None, last_exc
 
 
@@ -1371,21 +1737,23 @@ def download_one(record, domain_dir, db_by_digest, new_db_rows, lock,
     try:
         version_file = build_version_path(domain_dir, url, ts)
         if is_html:
-            # HTML — отдельная mutable-копия. Никогда не открываем hardlink на
-            # запись: atomic replace отсоединяет его от store без лишнего полного
-            # копирования старого файла.
-            if not os.path.exists(version_file) or os.path.getsize(version_file) <= 0 or not reused:
-                atomic_copy_file(store_file, version_file)
+            # HTML is a mutable derived copy. Gzip-wrapped captures must be
+            # decoded first so the view remains a readable HTML document.
+            needs_decode = _gzip_payload_needs_decoding(store_file, url, record.get('mimetype', ''))
+            existing_is_raw_gzip = needs_decode and os.path.isfile(version_file) and _has_gzip_signature(version_file)
+            if (not os.path.exists(version_file) or os.path.getsize(version_file) <= 0
+                    or not reused or existing_is_raw_gzip):
+                write_view_file(store_file, version_file, url, record.get('mimetype', ''), mutable=True)
         elif (not os.path.exists(version_file) or
-              not derived_file_matches_store(store_file, version_file, digest, sha)):
+              not derived_file_matches_store(store_file, version_file, digest, sha, url, record.get('mimetype', ''))):
             try:
                 if os.path.exists(version_file):
                     os.remove(version_file)
             except OSError:
                 pass
-            link_or_copy(store_file, version_file)
+            write_view_file(store_file, version_file, url, record.get('mimetype', ''))
     except Exception as e:
-        LOGGER.error(f'Раскладка {url} @ {ts}: {e}')
+        LOGGER.error(f'File organization {url} @ {ts}: {e}')
 
     with lock:
         new_db_rows.append([
@@ -1394,9 +1762,6 @@ def download_one(record, domain_dir, db_by_digest, new_db_rows, lock,
             datetime.now().strftime('%Y-%m-%d %H:%M'),
         ])
         db_by_digest[digest] = {'size_bytes': size, 'sha256': sha, 'store_path': os.path.relpath(store_file, domain_dir)}
-        progress = counters['done'] + counters['reused'] + counters['failed']
-        if progress % 25 == 0 or progress == total:
-            print(f"  [{progress}/{total}] новых: {counters['done']}, уже было: {counters['reused']}, ошибок: {counters['failed']}")
 
 
 # ==================== РАСКЛАДКА: ДОКУМЕНТЫ, ФОТО, СВЕЖИЙ САЙТ ====================
@@ -1422,7 +1787,7 @@ MIME_TO_EXT = {
 def classify_doc_ext(original_url, mimetype):
     """Расширение по URL - не всегда правда: документ может отдаваться через
     download.php?id=123 или export.asp, и тогда get_extension() вернёт
-    'php'/'asp', а файл потеряется - не попадёт ни в 02_ДОКУМЕНТЫ, ни на
+    'php'/'asp', а файл потеряется - не попадёт ни в 02_DOCUMENTS, ни на
     разбор метаданных. Wayback помнит настоящий Content-Type - используем
     его как запасной критерий, когда расширение непохоже на документ."""
     ext = get_extension(original_url)
@@ -1433,14 +1798,14 @@ def classify_doc_ext(original_url, mimetype):
 
 
 def nice_filename(url, ts, digest, forced_ext=None):
-    base = os.path.basename(urllib.parse.urlsplit(url).path) or "файл"
+    base = os.path.basename(urllib.parse.urlsplit(url).path) or "file"
     base = sanitize_segment(urllib.parse.unquote(base))
     stem, ext = os.path.splitext(base)
     if forced_ext and ext.lstrip(".").lower() != forced_ext.lower():
         # реальный тип определили по mimetype (например download.php оказался
         # pdf) - имя файла должно получить рабочее расширение, иначе Windows
-        # не поймёт, чем это открывать, даже когда файл лежит в 02_ДОКУМЕНТЫ
-        stem = stem or "файл"
+        # не поймёт, чем это открывать, даже когда файл лежит в 02_DOCUMENTS
+        stem = stem or "file"
         ext = "." + forced_ext
     return f"{date_only(ts)}_{stem}{ext}"
 
@@ -1476,14 +1841,14 @@ def organize_by_type(domain_dir, all_rows):
             dest = os.path.join(dest_dir, f"{stem}_{digest[:6]}{e}")
         try:
             if os.path.exists(dest):
-                if derived_file_matches_store(store_file, dest, digest, r.get("sha256", "")):
+                if derived_file_matches_store(store_file, dest, digest, r.get("sha256", ""), url, r.get("mimetype", "")):
                     continue
                 # Для того же digest это восстановление stale/corrupt derived-файла.
                 # При коллизии имени выше уже выбран отдельный digest-suffix.
                 os.remove(dest)
-            link_or_copy(store_file, dest)
+            write_view_file(store_file, dest, url, r.get("mimetype", ""))
         except Exception as e:
-            LOGGER.debug(f"Раскладка по типу {url}: {e}")
+            LOGGER.debug(f"File type organization for {url}: {e}")
     return docs, photos
 
 
@@ -1507,18 +1872,108 @@ def build_latest_site(domain_dir, all_rows):
         is_html = ext in HTML_EXTS or r.get("mimetype", "").startswith("text/html")
         try:
             if is_html:
-                if not os.path.exists(dest):
-                    atomic_copy_file(store_file, dest)
+                source_needs_decode = _gzip_payload_needs_decoding(store_file, r["original_url"], r.get("mimetype", ""))
+                destination_is_raw_gzip = source_needs_decode and os.path.isfile(dest) and _has_gzip_signature(dest)
+                if not os.path.exists(dest) or destination_is_raw_gzip:
+                    write_view_file(store_file, dest, r["original_url"], r.get("mimetype", ""), mutable=True)
             else:
                 if (not os.path.exists(dest) or
-                        not derived_file_matches_store(store_file, dest, r["digest"], r.get("sha256", ""))):
+                        not derived_file_matches_store(store_file, dest, r["digest"], r.get("sha256", ""), r["original_url"], r.get("mimetype", ""))):
                     if os.path.exists(dest):
                         os.remove(dest)
-                    link_or_copy(store_file, dest)
+                    write_view_file(store_file, dest, r["original_url"], r.get("mimetype", ""))
             placed.append((r["original_url"], dest))
         except Exception as e:
-            LOGGER.debug(f"Свежий сайт {r['original_url']}: {e}")
+            LOGGER.debug(f"Latest-site view for {r['original_url']}: {e}")
     return placed
+
+
+def normalize_gzip_derived_views(domain_dir, all_rows):
+    """Repair stale derived files that still contain a gzip wrapper.
+
+    The canonical store is intentionally untouched. Targets are reconstructed
+    from database rows so that only resources whose URL/MIME semantics say
+    the gzip bytes are a transport wrapper are decoded. This is a final
+    invariant pass after normal organization, covering latest-site, documents,
+    and dated versions alike.
+    """
+    targets = {}
+    latest_by_rel = {}
+    doc_dest_owners = {}
+
+    for r in all_rows:
+        url = r.get("original_url", "")
+        cur = latest_by_rel.get(build_relative_path(url))
+        if cur is None or r.get("timestamp", "") > cur.get("timestamp", ""):
+            latest_by_rel[build_relative_path(url)] = r
+
+    # Build all expected derived targets using the same naming rules as the
+    # primary organization functions. A target is keyed by normalized path.
+    for r in all_rows:
+        url = r.get("original_url", "")
+        ts = r.get("timestamp", "")
+        digest = r.get("digest", "")
+        mime = r.get("mimetype", "")
+        store_file = os.path.join(domain_dir, r.get("store_path", ""))
+        if not os.path.isfile(store_file) or not _gzip_payload_needs_decoding(store_file, url, mime):
+            continue
+
+        ext = get_extension(url)
+        is_html = ext in HTML_EXTS or mime.startswith("text/html")
+
+        version_file = build_version_path(domain_dir, url, ts)
+        targets[os.path.normcase(os.path.normpath(version_file))] = (
+            store_file, version_file, url, mime, is_html)
+
+        doc_ext = classify_doc_ext(url, mime)
+        if doc_ext in DOC_EXTS:
+            doc_dir = os.path.join(domain_dir, DIR_DOCS, doc_ext)
+            name = nice_filename(url, ts, digest, forced_ext=doc_ext)
+            dest = os.path.join(doc_dir, name)
+            owner_key = os.path.normcase(os.path.normpath(dest))
+            owner = doc_dest_owners.get(owner_key)
+            if owner is None:
+                doc_dest_owners[owner_key] = digest
+            elif owner != digest:
+                stem, ext_part = os.path.splitext(name)
+                dest = os.path.join(doc_dir, f"{stem}_{digest[:6]}{ext_part}")
+            targets[os.path.normcase(os.path.normpath(dest))] = (
+                store_file, dest, url, mime, False)
+
+    for rel, r in latest_by_rel.items():
+        url = r.get("original_url", "")
+        mime = r.get("mimetype", "")
+        store_file = os.path.join(domain_dir, r.get("store_path", ""))
+        if not os.path.isfile(store_file) or not _gzip_payload_needs_decoding(store_file, url, mime):
+            continue
+        latest_dir = os.path.join(domain_dir, DIR_LATEST)
+        dest = guard_path_length(os.path.join(latest_dir, rel), latest_dir, url)
+        ext = get_extension(url)
+        is_html = ext in HTML_EXTS or mime.startswith("text/html")
+        targets[os.path.normcase(os.path.normpath(dest))] = (
+            store_file, dest, url, mime, is_html)
+
+    normalized = 0
+    failures = 0
+    for store_file, dest, url, mime, mutable in targets.values():
+        if not os.path.isfile(dest) or not _has_gzip_signature(dest):
+            continue
+        try:
+            # Replace the derived file atomically; if it was a hardlink, only
+            # this directory entry is replaced and the immutable store stays intact.
+            write_view_file(store_file, dest, url, mime, mutable=mutable)
+            if _has_gzip_signature(dest):
+                raise ValueError("derived file still has a GZIP signature after normalization")
+            normalized += 1
+        except Exception as e:
+            failures += 1
+            LOGGER.warning(f"Could not normalize GZIP-derived view {dest}: {e}")
+
+    if normalized:
+        LOGGER.info(f"Normalized {normalized} stale GZIP-wrapped derived view file(s)")
+    if failures:
+        LOGGER.warning(f"Could not normalize {failures} GZIP-wrapped derived view file(s)")
+    return normalized, failures
 
 
 # ==================== ОФЛАЙН-ССЫЛКИ ====================
@@ -1702,7 +2157,7 @@ class LinkRewriter(HTMLParser):
             # относительные ссылки на странице против живого сайта, даже
             # если мы аккуратно переписали их на локальные пути - вся
             # офлайн-навигация сломается молча, без единой ошибки в консоли
-            self.out.append("<!-- удалён тег <base>, ломал офлайн-ссылки -->")
+            self.out.append("<!-- Removed the <base> tag because it breaks offline links. -->")
             self.changed += 1
             return
 
@@ -1803,6 +2258,32 @@ def atomic_write_bytes(path, data):
             pass
 
 
+def atomic_gzip_decompress(src, dst):
+    """Atomically expand a gzip-wrapped response into a derived view file."""
+    ensure_parent_dir(dst)
+    tmp = dst + '.__gzip_tmp'
+    try:
+        total = 0
+        with gzip.open(src, 'rb') as fs, open(tmp, 'wb') as fd:
+            while True:
+                chunk = fs.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_FILE_BYTES:
+                    raise ValueError(f"decompressed view exceeds {human_size(MAX_FILE_BYTES)}")
+                fd.write(chunk)
+            fd.flush()
+            os.fsync(fd.fileno())
+        os.replace(tmp, dst)
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+
+
 def atomic_copy_file(src, dst):
     ensure_parent_dir(dst)
     tmp = dst + '.__copy_tmp'
@@ -1855,7 +2336,7 @@ def rewrite_links_in_group(pairs, edges=None):
                 raw = f.read()
             text = decode_html(raw)
         except Exception as e:
-            LOGGER.debug(f"Rewrite чтение {path}: {e}")
+            LOGGER.debug(f"Rewrite read {path}: {e}")
             continue
 
         def resolve(link, _url=url, _path=path):
@@ -1877,14 +2358,14 @@ def rewrite_links_in_group(pairs, edges=None):
             new_text = fix_charset_meta(rewriter.get_html())
         except Exception as e:
             # совсем битая разметка - оставляем файл как есть, не рискуем его испортить
-            LOGGER.debug(f"Rewrite разбор {path}: {e}")
+            LOGGER.debug(f"Rewrite parse {path}: {e}")
             continue
 
         try:
             atomic_write_bytes(path, new_text.encode("utf-8"))
             changed_total += rewriter.changed
         except Exception as e:
-            LOGGER.debug(f"Rewrite запись {path}: {e}")
+            LOGGER.debug(f"Rewrite write {path}: {e}")
     return changed_total
 
 
@@ -1892,9 +2373,30 @@ def rewrite_all_versions(domain_dir, all_rows, latest_pairs):
     by_version = {}
     for r in all_rows:
         folder = folder_ts(r["timestamp"])
-        path = build_version_path(domain_dir, r["original_url"], r["timestamp"])
+        url = r["original_url"]
+        store_file = os.path.join(domain_dir, r["store_path"])
+        path = build_version_path(domain_dir, url, r["timestamp"])
+        if not os.path.isfile(store_file):
+            continue
+        ext = get_extension(url)
+        is_html = ext in HTML_EXTS or (r.get("mimetype", "") or "").startswith("text/html")
+        needs_decode = _gzip_payload_needs_decoding(store_file, url, r.get("mimetype", ""))
+        try:
+            if not os.path.isfile(path):
+                write_view_file(store_file, path, url, r.get("mimetype", ""), mutable=is_html)
+            elif needs_decode:
+                # A previous build may have hard-linked the gzip wrapper under
+                # a .pdf/.html name. Replace that derived link with decoded bytes.
+                if _has_gzip_signature(path):
+                    write_view_file(store_file, path, url, r.get("mimetype", ""), mutable=is_html)
+            elif not is_html and not derived_file_matches_store(
+                    store_file, path, r["digest"], r.get("sha256", ""), url, r.get("mimetype", "")):
+                os.remove(path)
+                write_view_file(store_file, path, url, r.get("mimetype", ""))
+        except Exception as e:
+            LOGGER.warning(f"Could not normalize version view for {url} @ {r['timestamp']}: {e}")
         if os.path.isfile(path):
-            by_version.setdefault(folder, []).append((r["original_url"], path))
+            by_version.setdefault(folder, []).append((url, path))
 
     total = 0
     edges = []
@@ -1904,9 +2406,69 @@ def rewrite_all_versions(domain_dir, all_rows, latest_pairs):
     return total, edges
 
 
+def build_link_graph_edges_from_store(domain_dir, all_rows):
+    """Rebuild link-graph edges from canonical bytes without touching archive views.
+
+    Option 02 is offline and must not depend on already-rewritten HTML copies.
+    Each capture group is copied to a temporary workspace, where the existing
+    link resolver can inspect it safely. Canonical files and derived views stay
+    untouched by this analysis.
+    """
+    by_version = {}
+    latest_by_rel = {}
+    for row in all_rows:
+        url = row.get("original_url", "")
+        mime = (row.get("mimetype", "") or "").lower()
+        ext = get_extension(url)
+        is_html = ext in HTML_EXTS or mime.startswith("text/html")
+        is_css = ext == "css" or mime.startswith("text/css")
+        if not (is_html or is_css):
+            continue
+        store_file = os.path.join(domain_dir, row.get("store_path", ""))
+        if not os.path.isfile(store_file):
+            continue
+        folder = folder_ts(row.get("timestamp", ""))
+        by_version.setdefault(folder, []).append(row)
+        rel = build_relative_path(url)
+        current = latest_by_rel.get(rel)
+        if current is None or row.get("timestamp", "") > current.get("timestamp", ""):
+            latest_by_rel[rel] = row
+
+    edges = []
+    with tempfile.TemporaryDirectory(prefix="q2-link-graph-") as temp_root:
+        def collect_group(rows, label):
+            pairs = []
+            group_dir = os.path.join(temp_root, sanitize_segment(label))
+            os.makedirs(group_dir, exist_ok=True)
+            for index, row in enumerate(rows):
+                url = row.get("original_url", "")
+                mime = row.get("mimetype", "") or ""
+                store_file = os.path.join(domain_dir, row.get("store_path", ""))
+                ext = get_extension(url)
+                is_html = ext in HTML_EXTS or mime.lower().startswith("text/html")
+                is_css = ext == "css" or mime.lower().startswith("text/css")
+                if not (is_html or is_css) or not os.path.isfile(store_file):
+                    continue
+                suffix = ".html" if is_html else ".css"
+                temp_path = os.path.join(group_dir, f"item_{index:08d}{suffix}")
+                try:
+                    raw = read_store_content(store_file, url, mime)
+                    with open(temp_path, "wb") as f:
+                        f.write(raw)
+                    pairs.append((url, temp_path))
+                except Exception as exc:
+                    LOGGER.warning(f"Link-graph source skipped for {url}: {exc}")
+            if pairs:
+                rewrite_links_in_group(pairs, edges)
+            shutil.rmtree(group_dir, ignore_errors=True)
+
+        for folder, rows in sorted(by_version.items()):
+            collect_group(rows, "version_" + folder)
+        collect_group(list(latest_by_rel.values()), "latest")
+    return edges
+
+
 def report_link_graph(domain_dir, edges, all_rows):
-    if not edges:
-        return None
     known_urls = {r["original_url"] for r in all_rows}
     incoming = {}
     external_domains = {}
@@ -1933,34 +2495,34 @@ def report_link_graph(domain_dir, edges, all_rows):
 
     reports_dir = os.path.join(domain_dir, DIR_REPORTS)
     os.makedirs(reports_dir, exist_ok=True)
-    path = os.path.join(reports_dir, "граф_ссылок.txt")
+    path = os.path.join(reports_dir, "link_graph.txt")
     with open(path, "w", encoding="utf-8") as f:
-        f.write("ГРАФ ССЫЛОК\n")
-        f.write(f"Всего связей между страницами: {len(edges)}\n")
+        f.write("LINK GRAPH\n")
+        f.write(f"Total page-to-page links: {len(edges)}\n")
         f.write("=" * 78 + "\n\n")
 
-        f.write("САМЫЕ СВЯЗАННЫЕ СТРАНИЦЫ (топ 30 по входящим ссылкам):\n")
+        f.write("MOST-LINKED PAGES (top 30 by incoming links):\n")
         for u, sources in most_linked:
-            f.write(f"  {len(sources):>4} вход.  {u}\n")
+            f.write(f"  {len(sources):>4} incoming  {u}\n")
 
-        f.write(f"\nСТРАНИЦЫ БЕЗ ВХОДЯЩИХ ССЫЛОК ({len(isolated_pages)}):\n")
-        f.write("  (на них никто внутри сайта не ссылается - найдены только через CDX,\n"
-                "   значит либо убрали ссылку, либо страница никогда и не была публичной)\n")
+        f.write(f"\nPAGES WITH NO INCOMING LINKS ({len(isolated_pages)}):\n")
+        f.write("  (no pages on this site link to them; they were found through CDX only,\n"
+                "   so the link may have been removed, or the page may never have been public)\n")
         for u in sorted(isolated_pages)[:100]:
             f.write(f"  {u}\n")
         if len(isolated_pages) > 100:
-            f.write(f"  ... и ещё {len(isolated_pages) - 100}\n")
+            f.write(f"  ... and {len(isolated_pages) - 100} more\n")
 
-        f.write(f"\nДОКУМЕНТЫ БЕЗ ССЫЛОК С HTML-СТРАНИЦ ({len(isolated_docs)}):\n")
+        f.write(f"\nDOCUMENTS NOT LINKED FROM HTML PAGES ({len(isolated_docs)}):\n")
         for u in sorted(isolated_docs)[:100]:
             f.write(f"  {u}\n")
 
-        f.write(f"\nВНЕШНИЕ ДОМЕНЫ, НА КОТОРЫЕ ССЫЛАЕТСЯ САЙТ ({len(external_domains)}):\n")
+        f.write(f"\nEXTERNAL DOMAINS LINKED BY THIS SITE ({len(external_domains)}):\n")
         for host, count in sorted(external_domains.items(), key=lambda kv: -kv[1])[:50]:
             f.write(f"  {count:>4}  {host}\n")
 
     top = most_linked[0][0] if most_linked else "-"
-    print(f"  граф ссылок: {len(edges)} связей, изолированных страниц: {len(isolated_pages)}")
+    print(f"  Link graph: {len(edges)} links, isolated pages: {len(isolated_pages)}")
     return path
 
 
@@ -1973,8 +2535,9 @@ def fetch_status_history(url_value, match_type):
         params["matchType"] = match_type
     cdx_url = "https://web.archive.org/cdx/search/cdx?" + urllib.parse.urlencode(params)
     req = urllib.request.Request(cdx_url, headers=HEADERS)
-    with urlopen_throttled(req, 90, context="история статусов") as resp:
-        lines = [l.decode("utf-8", errors="replace").strip() for l in resp]
+    with ConsoleStatus("Checking capture history", detail=f"{match_type} | status timeline"):
+        with urlopen_throttled(req, CDX_REQUEST_TIMEOUT, context="status history") as resp:
+            lines = [l.decode("utf-8", errors="replace").strip() for l in resp]
     records = []
     for line in lines:
         parts = line.split(" ")
@@ -1982,23 +2545,52 @@ def fetch_status_history(url_value, match_type):
             records.append({"original": parts[0], "timestamp": parts[1], "statuscode": parts[2]})
     return records
 
-
-def report_deleted_pages(domain, domain_dir):
-    print("\nИщу страницы, которые раньше работали, а потом исчезли...")
+def report_deleted_pages(domain, domain_dir, target_url=None):
+    print("\nLooking for pages that were archived successfully but later became unavailable...")
     records = []
-    for match_type, description in CDX_MATCH_CHAIN:
-        url_value = domain if match_type != "exact" else domain.rstrip("/") + "/"
-        try:
-            records = fetch_status_history(url_value, match_type)
-        except Exception as e:
-            LOGGER.warning(f"Удалённые: режим {match_type} не ответил ({e})")
-            continue
-        if records:
-            break
+    if target_url:
+        parsed = urllib.parse.urlsplit("http://" + target_url)
+        path = parsed.path or "/"
+        final_segment = path.rstrip("/").rsplit("/", 1)[-1]
+        queries = [(target_url, "exact")]
+        if not os.path.splitext(final_segment)[1] and not parsed.query:
+            prefix = target_url.rstrip("/") + "/"
+            queries.append((prefix, "prefix"))
+    else:
+        queries = [(domain, kind) for kind, _ in CDX_MATCH_CHAIN]
+        queries = [(value if kind != "exact" else value.rstrip("/") + "/", kind)
+                   for value, kind in queries]
 
+    failed_queries = []
+    for url_value, match_type in queries:
+        try:
+            part = fetch_status_history(url_value, match_type)
+            records.extend(part)
+            if not target_url:
+                break
+        except Exception as e:
+            error_code = classify_error(e)
+            failed_queries.append(error_code)
+            LOGGER.warning(f"Removed-page history query failed ({match_type}): {e}")
+            if not target_url:
+                # Only a timeout justifies one narrower query; do not fan out after 503/429/network errors.
+                if error_code in ("504", "TIMEOUT") and match_type == "domain":
+                    print("  Broad status-history query timed out; trying the primary hostname once.")
+                    continue
+                break
+
+    unique_records = {}
+    for item in records:
+        unique_records.setdefault((item["original"], item["timestamp"], item["statuscode"]), item)
+    records = list(unique_records.values())
     if not records:
-        print("  не удалось получить историю статусов (архив недоступен)")
+        if failed_queries:
+            print("  Could not retrieve capture history; removed-page results are unknown.")
+        else:
+            print("  No capture history returned for this scope.")
         return []
+    if failed_queries:
+        print(f"  WARNING: removed-page analysis is partial; a history query failed ({', '.join(failed_queries)}).")
 
     by_url = {}
     for r in records:
@@ -2008,7 +2600,7 @@ def report_deleted_pages(domain, domain_dir):
     for url, items in by_url.items():
         items.sort(key=lambda x: x["timestamp"])
         statuses = [i["statuscode"] for i in items]
-        if any(s == "200" for s in statuses) and statuses[-1].startswith(("4", "5")):
+        if any(status == "200" for status in statuses) and statuses[-1].startswith(("4", "5")):
             last_ok = max(i["timestamp"] for i in items if i["statuscode"] == "200")
             deleted.append({"url": url, "last_ok": last_ok,
                             "died_at": items[-1]["timestamp"],
@@ -2017,21 +2609,19 @@ def report_deleted_pages(domain, domain_dir):
 
     reports_dir = os.path.join(domain_dir, DIR_REPORTS)
     os.makedirs(reports_dir, exist_ok=True)
-    path = os.path.join(reports_dir, "удалённые_страницы.txt")
+    path = os.path.join(reports_dir, "removed_pages.txt")
     with open(path, "w", encoding="utf-8") as f:
-        f.write(f"УДАЛЁННЫЕ СТРАНИЦЫ: {domain}\n")
-        f.write(f"Проверено адресов: {len(by_url)}   Найдено удалённых: {len(deleted)}\n")
+        f.write(f"REMOVED PAGES: {domain}\n")
+        f.write(f"URLs checked: {len(by_url)}   Removed pages found: {len(deleted)}\n")
         f.write("=" * 78 + "\n\n")
         for d in deleted:
             f.write(f"{d['url']}\n")
-            f.write(f"  работала до: {pretty_ts(d['last_ok'])}\n")
-            f.write(f"  стала недоступна ({d['last_status']}): {pretty_ts(d['died_at'])}\n\n")
+            f.write(f"  last successful capture: {pretty_ts(d['last_ok'])}\n")
+            f.write(f"  later became unavailable ({d['last_status']}): {pretty_ts(d['died_at'])}\n\n")
 
-    print(f"  найдено удалённых страниц: {len(deleted)}")
+    print(f"  Removed pages found: {len(deleted)}")
     return deleted
 
-
-# ==================== МЕТАДАННЫЕ ДОКУМЕНТОВ ====================
 
 PDF_FIELDS = ["Author", "Creator", "Producer", "Title", "Subject",
               "Company", "CreationDate", "ModDate"]
@@ -2254,7 +2844,7 @@ def extract_pdf_metadata(data: bytes):
     """Возвращает (meta, причина_если_пусто). Причина нужна для отчёта -
     чтобы не молчать, когда метаданные не читаются, а объяснить, почему."""
     if not is_probably_pdf(data):
-        return {}, "не похоже на настоящий PDF (архив мог отдать страницу-заглушку)"
+        return {}, "does not look like a valid PDF (Wayback may have returned a placeholder page)"
 
     meta = {}
     scan_pdf_text_for_fields(data.decode("latin-1", errors="replace"), meta)
@@ -2262,7 +2852,7 @@ def extract_pdf_metadata(data: bytes):
         for stream_text in iter_decompressed_streams(data):
             scan_pdf_text_for_fields(stream_text, meta)
     if not meta:
-        return {}, "метаданные не найдены (пустые либо в незнакомом формате)"
+        return {}, "metadata not found (empty or unrecognized format)"
     return meta, None
 
 
@@ -2282,7 +2872,7 @@ def extract_office_metadata(path):
     with open(path, "rb") as f:
         head = f.read(4)
     if not is_probably_office_zip(head):
-        return {}, "не похоже на настоящий docx/xlsx/pptx (архив мог отдать заглушку)"
+        return {}, "does not look like a valid docx/xlsx/pptx file (Wayback may have returned a placeholder)"
 
     meta = {}
     try:
@@ -2298,9 +2888,9 @@ def extract_office_metadata(path):
                         if value and looks_like_text(value) and field not in meta:
                             meta[field] = value[:200]
     except (zipfile.BadZipFile, OSError, KeyError) as e:
-        return {}, f"файл повреждён или не читается ({e})"
+        return {}, f"file is damaged or unreadable ({e})"
     if not meta:
-        return {}, "метаданные не найдены (пустые либо в незнакомом формате)"
+        return {}, "metadata not found (empty or unrecognized format)"
     return meta, None
 
 
@@ -2437,27 +3027,27 @@ def extract_exif(data: bytes):
                 break
             pos += 2 + seg_len
         if exif_data is None:
-            return {}, "EXIF не найден (фото могло быть пересжато при публикации)"
+            return {}, "EXIF not found (the image may have been recompressed during publication)"
     elif data[:2] in (b"II", b"MM") and len(data) >= 8:
         # обычный TIFF-файл - он САМ является TIFF-структурой, JPEG-обвязки
         # искать не надо, разбираем напрямую
         exif_data = data
     else:
-        return {}, "не похоже на JPEG или TIFF (архив мог отдать заглушку)"
+        return {}, "does not look like JPEG or TIFF (Wayback may have returned a placeholder)"
 
     if exif_data[:2] == b"II":
         endian = "<"
     elif exif_data[:2] == b"MM":
         endian = ">"
     else:
-        return {}, "битый заголовок EXIF"
+        return {}, "invalid EXIF header"
 
     try:
         tags = _parse_tiff_tags(exif_data, endian)
     except (struct.error, IndexError) as e:
-        return {}, f"ошибка разбора EXIF ({e})"
+        return {}, f"EXIF parsing error ({e})"
 
-    return tags, (None if tags else "EXIF-блок пуст")
+    return tags, (None if tags else "empty EXIF block")
 
 
 def report_exif(domain_dir, all_rows):
@@ -2468,17 +3058,22 @@ def report_exif(domain_dir, all_rows):
         return []
 
     unique_photos = dedup_by_digest(photo_rows)
-    print(f"Читаю EXIF {len(unique_photos)} фото (они покрывают {len(photo_rows)} появлений)...")
     cache = {}
-    for r in unique_photos:
-        path = os.path.join(domain_dir, r["store_path"])
-        if not os.path.isfile(path):
-            continue
-        try:
-            with open(path, "rb") as f:
-                cache[r["digest"]] = extract_exif(f.read())
-        except Exception as e:
-            LOGGER.debug(f"EXIF {path}: {e}")
+    scan_progress = {"processed": 0}
+
+    def exif_scan_detail():
+        return f"{scan_progress['processed']}/{len(unique_photos)} unique photos | metadata extracted {sum(1 for meta, _ in cache.values() if meta)}"
+
+    with ConsoleStatus("Reading photo EXIF", detail_provider=exif_scan_detail):
+        for r in unique_photos:
+            scan_progress["processed"] += 1
+            path = os.path.join(domain_dir, r["store_path"])
+            if not os.path.isfile(path):
+                continue
+            try:
+                cache[r["digest"]] = extract_exif(read_store_content(path, r["original_url"], r.get("mimetype", "")))
+            except Exception as e:
+                LOGGER.debug(f"EXIF {path}: {e}")
 
     results = []
     for r in photo_rows:
@@ -2500,45 +3095,45 @@ def report_exif(domain_dir, all_rows):
     reports_dir = os.path.join(domain_dir, DIR_REPORTS)
     os.makedirs(reports_dir, exist_ok=True)
 
-    csv_path = os.path.join(reports_dir, "exif.csv")
+    csv_path = os.path.join(reports_dir, "photo_exif.csv")
     with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
-        w.writerow(["адрес", "дата_снимка", "камера", "модель", "программа",
-                    "снято_когда", "широта", "долгота"])
+        w.writerow(["url", "capture_date", "camera_make", "camera_model", "software",
+                    "date_taken", "latitude", "longitude"])
         for t in results:
             w.writerow([t["_url"], t["_timestamp"], t.get("Make", ""), t.get("Model", ""),
                         t.get("Software", ""), t.get("DateTimeOriginal", t.get("DateTime", "")),
                         t.get("GPSLatitudeDecimal", ""), t.get("GPSLongitudeDecimal", "")])
 
-    txt_path = os.path.join(reports_dir, "exif.txt")
+    txt_path = os.path.join(reports_dir, "photo_exif.txt")
     with open(txt_path, "w", encoding="utf-8") as f:
-        f.write("EXIF ИЗ ФОТО\n")
-        f.write(f"Фото с метаданными: {len(results)} из {len(photo_rows)}\n")
-        f.write(f"Фото с координатами GPS: {len(with_gps)}\n")
-        f.write("ВАЖНО: EXIF - это то, что записала камера/приложение (может быть подделано\n"
-                "или отсутствовать после пересжатия) - не доказательство, а зацепка.\n")
+        f.write("PHOTO EXIF METADATA\n")
+        f.write(f"Photos with metadata: {len(results)} of {len(photo_rows)}\n")
+        f.write(f"Photos with GPS coordinates: {len(with_gps)}\n")
+        f.write("NOTE: EXIF is metadata written by the camera/app (it can be forged\n"
+                "or removed by recompression). Treat it as a lead, not proof.\n")
         f.write("=" * 78 + "\n\n")
         if with_gps:
-            f.write("ФОТО С GPS-КООРДИНАТАМИ:\n")
+            f.write("PHOTOS WITH GPS COORDINATES:\n")
             for t in with_gps:
                 lat, lon = t["GPSLatitudeDecimal"], t["GPSLongitudeDecimal"]
                 f.write(f"  {t['_url']}\n")
-                f.write(f"    координаты: {lat}, {lon}  "
+                f.write(f"    coordinates: {lat}, {lon}  "
                         f"(https://www.google.com/maps?q={lat},{lon})\n")
                 if t.get("DateTimeOriginal"):
-                    f.write(f"    снято: {t['DateTimeOriginal']}\n")
+                    f.write(f"    date taken: {t['DateTimeOriginal']}\n")
                 f.write("\n")
-        f.write("ВСЕ ФОТО С МЕТАДАННЫМИ:\n\n")
+        f.write("ALL PHOTOS WITH METADATA:\n\n")
         for t in results:
             f.write(f"{t['_url']}  ({pretty_ts(t['_timestamp'])})\n")
-            for key, label in (("Make", "камера"), ("Model", "модель"),
-                                ("Software", "программа"),
-                                ("DateTimeOriginal", "снято"), ("DateTime", "изменено")):
+            for key, label in (("Make", "camera make"), ("Model", "camera model"),
+                                ("Software", "software"),
+                                ("DateTimeOriginal", "date taken"), ("DateTime", "modified")):
                 if t.get(key):
                     f.write(f"    {label}: {t[key]}\n")
             f.write("\n")
 
-    print(f"  EXIF: фото с метаданными {len(results)}, с GPS {len(with_gps)}")
+    print(f"  EXIF: {len(results)} photos with metadata, {len(with_gps)} with GPS")
     return results
 
 
@@ -2550,24 +3145,41 @@ def report_document_metadata(domain_dir, all_rows):
         return []
 
     unique_docs = dedup_by_digest(doc_rows)
-    print(f"Читаю метаданные {len(unique_docs)} документов "
-          f"(они покрывают {len(doc_rows)} появлений)...")
     cache = {}   # digest -> (meta, reason) - один физический файл не читаем дважды
-    for r in unique_docs:
-        path = os.path.join(domain_dir, r["store_path"])
-        if not os.path.isfile(path):
-            cache[r["digest"]] = ({}, "файл отсутствует на диске")
-            continue
-        ext = classify_doc_ext(r["original_url"], r.get("mimetype", ""))
-        try:
-            if ext == "pdf":
-                with open(path, "rb") as f:
-                    cache[r["digest"]] = extract_pdf_metadata(f.read())
-            else:
-                cache[r["digest"]] = extract_office_metadata(path)
-        except Exception as e:
-            cache[r["digest"]] = ({}, f"неожиданная ошибка ({e})")
-            LOGGER.debug(f"Метаданные {path}: {e}\n{traceback.format_exc()}")
+    scan_progress = {"processed": 0}
+
+    def document_scan_detail():
+        return f"{scan_progress['processed']}/{len(unique_docs)} unique documents | metadata extracted {sum(1 for meta, _ in cache.values() if meta)}"
+
+    with ConsoleStatus("Reading document metadata", detail_provider=document_scan_detail):
+        for r in unique_docs:
+            scan_progress["processed"] += 1
+            path = os.path.join(domain_dir, r["store_path"])
+            if not os.path.isfile(path):
+                cache[r["digest"]] = ({}, "file is missing from disk")
+                continue
+            ext = classify_doc_ext(r["original_url"], r.get("mimetype", ""))
+            try:
+                if ext == "pdf":
+                    cache[r["digest"]] = extract_pdf_metadata(read_store_content(path, r["original_url"], r.get("mimetype", "")))
+                elif _gzip_payload_needs_decoding(path, r["original_url"], r.get("mimetype", "")):
+                    tmp_path = None
+                    try:
+                        with tempfile.NamedTemporaryFile(prefix="q2-decoded-", suffix="." + ext, delete=False) as tmp:
+                            tmp_path = tmp.name
+                        atomic_gzip_decompress(path, tmp_path)
+                        cache[r["digest"]] = extract_office_metadata(tmp_path)
+                    finally:
+                        if tmp_path and os.path.exists(tmp_path):
+                            try:
+                                os.remove(tmp_path)
+                            except OSError:
+                                pass
+                else:
+                    cache[r["digest"]] = extract_office_metadata(path)
+            except Exception as e:
+                cache[r["digest"]] = ({}, f"unexpected error ({e})")
+                LOGGER.debug(f"Metadata {path}: {e}\n{traceback.format_exc()}")
 
     results = []
     skip_reasons = {}
@@ -2584,14 +3196,14 @@ def report_document_metadata(domain_dir, all_rows):
     reports_dir = os.path.join(domain_dir, DIR_REPORTS)
     os.makedirs(reports_dir, exist_ok=True)
 
-    csv_path = os.path.join(reports_dir, "метаданные_документов.csv")
+    csv_path = os.path.join(reports_dir, "document_metadata.csv")
     fields = ["_url", "_timestamp", "Author", "LastModifiedBy", "Company", "Manager",
               "Creator", "Producer", "Title", "Subject", "CreationDate", "ModDate"]
     with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
-        w.writerow(["адрес", "дата_снимка", "автор", "последний_правил", "организация",
-                    "руководитель", "программа", "генератор", "заголовок", "тема",
-                    "создан", "изменён"])
+        w.writerow(["url", "capture_date", "author", "last_modified_by", "organization",
+                    "manager", "software", "generator", "title", "subject",
+                    "created", "modified"])
         for meta in results:
             w.writerow([meta.get(k, "") for k in fields])
 
@@ -2606,35 +3218,34 @@ def report_document_metadata(domain_dir, all_rows):
         if v:
             orgs[v] = orgs.get(v, 0) + 1
 
-    txt_path = os.path.join(reports_dir, "метаданные_документов.txt")
+    txt_path = os.path.join(reports_dir, "document_metadata.txt")
     with open(txt_path, "w", encoding="utf-8") as f:
-        f.write("МЕТАДАННЫЕ ДОКУМЕНТОВ\n")
-        f.write(f"Документов с метаданными: {len(results)} из {len(doc_rows)}\n")
+        f.write("DOCUMENT METADATA\n")
+        f.write(f"Documents with metadata: {len(results)} of {len(doc_rows)}\n")
         if skip_reasons:
-            f.write("Не удалось прочитать:\n")
+            f.write("Could not read:\n")
             for reason, count in sorted(skip_reasons.items(), key=lambda kv: -kv[1]):
                 f.write(f"  {count}  -  {reason}\n")
         f.write("=" * 78 + "\n\n")
-        f.write("ЛЮДИ (авторы и те, кто правил файлы):\n")
+        f.write("PEOPLE (authors and editors):\n")
         for name, count in sorted(people.items(), key=lambda kv: -kv[1]):
-            f.write(f"  {name}   (в {count} документах)\n")
-        f.write("\nОРГАНИЗАЦИИ:\n")
+            f.write(f"  {name}   (in {count} documents)\n")
+        f.write("\nORGANIZATIONS:\n")
         for name, count in sorted(orgs.items(), key=lambda kv: -kv[1]):
-            f.write(f"  {name}   (в {count} документах)\n")
-        f.write("\n" + "=" * 78 + "\nПО ДОКУМЕНТАМ:\n\n")
+            f.write(f"  {name}   (in {count} documents)\n")
+        f.write("\n" + "=" * 78 + "\nDOCUMENT DETAILS:\n\n")
         for meta in results:
             f.write(f"{meta['_url']}  ({pretty_ts(meta['_timestamp'])})\n")
-            for key, label in (("Author", "автор"), ("LastModifiedBy", "последний правил"),
-                                ("Company", "организация"), ("Manager", "руководитель"),
-                                ("Creator", "программа"), ("Producer", "генератор"),
-                                ("Title", "заголовок"), ("CreationDate", "создан"),
-                                ("ModDate", "изменён")):
+            for key, label in (("Author", "author"), ("LastModifiedBy", "last edited by"),
+                                ("Company", "organization"), ("Manager", "manager"),
+                                ("Creator", "software"), ("Producer", "generator"),
+                                ("Title", "title"), ("CreationDate", "created"),
+                                ("ModDate", "modified")):
                 if meta.get(key):
                     f.write(f"    {label}: {meta[key]}\n")
             f.write("\n")
 
-    print(f"  документов с метаданными: {len(results)}, "
-          f"уникальных имён: {len(people)}, организаций: {len(orgs)}")
+    print(f"  Documents with metadata: {len(results)} | unique names: {len(people)} | organizations: {len(orgs)}")
     return results
 
 
@@ -2657,8 +3268,7 @@ def report_sitemap_robots(domain_dir, all_rows):
         if not os.path.isfile(path):
             continue
         try:
-            with open(path, "rb") as f:
-                text = decode_html(f.read())
+            text = decode_html(read_store_content(path, r["original_url"], r.get("mimetype", "")))
         except OSError:
             continue
 
@@ -2681,33 +3291,30 @@ def report_sitemap_robots(domain_dir, all_rows):
 
     reports_dir = os.path.join(domain_dir, DIR_REPORTS)
     os.makedirs(reports_dir, exist_ok=True)
-    path = os.path.join(reports_dir, "sitemap_и_robots.txt")
+    path = os.path.join(reports_dir, "sitemap_and_robots.txt")
     with open(path, "w", encoding="utf-8") as f:
-        f.write("АДРЕСА ИЗ SITEMAP.XML И ROBOTS.TXT\n")
-        f.write(f"Найдено адресов в sitemap: {len(found_urls)}\n")
-        f.write(f"Из них НЕТ в нашем архиве: {len(missing)}\n")
-        f.write(f"Путей, скрытых в robots.txt: {len(disallowed)}\n")
-        f.write(f"Sitemap-ов объявлено в robots.txt: {len(declared_sitemaps)}\n")
+        f.write("URLS FROM SITEMAP.XML AND ROBOTS.TXT\n")
+        f.write(f"URLs found in sitemaps: {len(found_urls)}\n")
+        f.write(f"Not present in this archive: {len(missing)}\n")
+        f.write(f"Paths disallowed by robots.txt: {len(disallowed)}\n")
+        f.write(f"Sitemaps declared in robots.txt: {len(declared_sitemaps)}\n")
         f.write("=" * 78 + "\n\n")
         if undiscovered_sitemaps:
-            f.write("SITEMAP, УКАЗАННЫЕ В ROBOTS.TXT, НО НЕ ПОПАВШИЕ В АРХИВ\n"
-                    "(стоит скачать/проверить руками - могут вести к скрытой структуре сайта):\n")
+            f.write("SITEMAPS DECLARED IN ROBOTS.TXT BUT NOT FOUND IN THE ARCHIVE\n"
+                    "(review these manually; they may reveal additional site structure):\n")
             for u in sorted(undiscovered_sitemaps):
                 f.write(f"  {u}\n")
             f.write("\n")
-        f.write("СКРЫТО В ROBOTS.TXT (то, что прятали от поисковиков):\n")
+        f.write("DISALLOWED BY ROBOTS.TXT (paths excluded from crawlers):\n")
         for d in sorted(disallowed):
             f.write(f"  {d}\n")
-        f.write("\nЕСТЬ В SITEMAP, НО НЕТ В АРХИВЕ:\n")
+        f.write("\nIN SITEMAPS BUT MISSING FROM THE ARCHIVE:\n")
         for u in sorted(missing):
             f.write(f"  {u}\n")
-        f.write("\nВСЕ АДРЕСА ИЗ SITEMAP:\n")
+        f.write("\nALL URLS FOUND IN SITEMAPS:\n")
         for u in sorted(found_urls):
             f.write(f"  {u}\n")
 
-    print(f"  sitemap/robots: адресов {len(found_urls)}, "
-          f"нет в архиве {len(missing)}, скрытых путей {len(disallowed)}, "
-          f"необнаруженных sitemap {len(undiscovered_sitemaps)}")
     return missing
 
 
@@ -2715,7 +3322,8 @@ def report_sitemap_robots(domain_dir, all_rows):
 
 
 
-def write_manifest(domain_dir, domain, date_from, date_to, include_exts, exclude_exts, all_rows):
+def write_manifest(domain_dir, domain, date_from, date_to, include_exts, exclude_exts, all_rows,
+                  target_url=None):
     """Самодокументирующийся архив: с какими параметрами качали, когда,
     сколько всего. Пригодится через полгода, когда забудешь, с какими
     настройками запускал прошлый раз."""
@@ -2743,6 +3351,8 @@ def write_manifest(domain_dir, domain, date_from, date_to, include_exts, exclude
         "tool_version": TOOL_VERSION,
         "schema_version": 2,
         "domain": domain,
+        "search_scope": ({"type": "path", "url": target_url}
+                         if target_url else {"type": "domain"}),
         "date_range": {"from": date_from or None, "to": date_to or None},
         "filters": {
             "include_ext": sorted(include_exts) if include_exts else [],
@@ -2786,40 +3396,36 @@ def report_timeline(domain_dir, all_rows):
 
     reports_dir = os.path.join(domain_dir, DIR_REPORTS)
     os.makedirs(reports_dir, exist_ok=True)
-    path = os.path.join(reports_dir, "таймлайн.txt")
+    path = os.path.join(reports_dir, "change_timeline.txt")
     with open(path, "w", encoding="utf-8") as f:
-        f.write("ТАЙМЛАЙН ИЗМЕНЕНИЙ САЙТА\n")
-        f.write(f"Уникальных адресов: {len(entries)}\n")
-        f.write("\nВАЖНО про 'последняя версия': архив хранит уникальные версии "
-                "контента, а не каждую отдельную проверку сайта. Если страница не "
-                "менялась годами, 'последняя' здесь - это дата, когда эта версия "
-                "ПОЯВИЛАСЬ, а не дата последнего визита archive.org - тот факт, что "
-                "её продолжали видеть неизменной вплоть до сегодня, отдельно не "
-                "фиксируется.\n")
+        f.write("WEBSITE CHANGE TIMELINE\n")
+        f.write(f"Unique URLs: {len(entries)}\n")
+        f.write("\nNOTE ABOUT THE 'LATEST VERSION': the archive stores unique content versions, "
+                "not every visit to the website. If a page has not changed for years, 'latest' means when this version "
+                "first appeared, not the date of archive.org's most recent visit. The fact that "
+                "it remained unchanged up to today is not recorded separately.\n")
         f.write("=" * 78 + "\n\n")
         for e in entries:
             f.write(f"{e['url']}\n")
-            f.write(f"  уникальных версий: {e['versions']}\n")
-            f.write(f"  первая версия появилась:   {pretty_ts(e['first'])}  ({human_size(e['first_size'])})\n")
-            f.write(f"  последняя версия появилась: {pretty_ts(e['last'])}  ({human_size(e['last_size'])})\n")
+            f.write(f"  unique versions: {e['versions']}\n")
+            f.write(f"  first version appeared:   {pretty_ts(e['first'])}  ({human_size(e['first_size'])})\n")
+            f.write(f"  latest version appeared: {pretty_ts(e['last'])}  ({human_size(e['last_size'])})\n")
             if e["versions"] > 1 and e["first_size"] and e["last_size"]:
                 delta = e["last_size"] - e["first_size"]
-                f.write(f"  изменение размера: {'+' if delta > 0 else '-'}"
+                f.write(f"  size change: {'+' if delta > 0 else '-'}"
                         f"{human_size(abs(delta))}\n")
             f.write("\n")
 
-    once_path = os.path.join(reports_dir, "встречено_один_раз.txt")
+    once_path = os.path.join(reports_dir, "single_capture_urls.txt")
     with open(once_path, "w", encoding="utf-8") as f:
-        f.write("АДРЕСА, ВСТРЕЧЕННЫЕ В АРХИВЕ ТОЛЬКО ОДИН РАЗ\n")
-        f.write("Часто интереснее тысячи неизменных css - могут быть временные "
-                "объявления, случайно проиндексированные черновики, утечки.\n")
-        f.write(f"Всего таких адресов: {len(once)}\n")
+        f.write("URLS FOUND ONLY ONCE IN THE ARCHIVE\n")
+        f.write("These may be more interesting than thousands of unchanged CSS files: they can be temporary "
+                "announcements, accidentally indexed drafts, or exposed material.\n")
+        f.write(f"Total URLs found once: {len(once)}\n")
         f.write("=" * 78 + "\n\n")
         for e in once:
             f.write(f"{pretty_ts(e['first'])}  ({human_size(e['first_size'])})  {e['url']}\n")
 
-    print(f"  таймлайн: {len(entries)} уникальных адресов, "
-          f"встречены один раз: {len(once)}")
     return entries
 
 
@@ -2864,7 +3470,7 @@ def phone_confidence(raw_match: str) -> str:
     """Голые 10-11 цифр без единого разделителя - это ЧАСТО не телефон,
     а ИНН, номер заказа, серийник и т.п. Помечаем такие отдельно, чтобы
     не мешать в одну кучу с реально надёжными находками."""
-    return "высокая" if PHONE_SEPARATOR_RE.search(raw_match) else "низкая"
+    return "high" if PHONE_SEPARATOR_RE.search(raw_match) else "low"
 
 
 class ContactScanner(HTMLParser):
@@ -2925,7 +3531,7 @@ def scan_contacts_in_text(html_text, emails, phones, socials, source):
         elif low.startswith("tel:"):
             normalized = clean_phone(href.split(":", 1)[1])
             if normalized:
-                phones.setdefault(normalized, {"sources": set(), "confidence": "высокая"})
+                phones.setdefault(normalized, {"sources": set(), "confidence": "high"})
                 phones[normalized]["sources"].add(source)
         for network, pattern in SOCIAL_PATTERNS.items():
             m = pattern.search(href)
@@ -2944,10 +3550,10 @@ def scan_contacts_in_text(html_text, emails, phones, socials, source):
     for hit in PHONE_RE.findall(plain):
         normalized = clean_phone(hit)
         if normalized:
-            entry = phones.setdefault(normalized, {"sources": set(), "confidence": "низкая"})
+            entry = phones.setdefault(normalized, {"sources": set(), "confidence": "low"})
             entry["sources"].add(source)
-            if phone_confidence(hit) == "высокая":
-                entry["confidence"] = "высокая"
+            if phone_confidence(hit) == "high":
+                entry["confidence"] = "high"
 
 
 def report_contacts(domain_dir, all_rows):
@@ -2956,85 +3562,88 @@ def report_contacts(domain_dir, all_rows):
     by_digest = {}
     for r in text_rows:
         by_digest.setdefault(r["digest"], []).append(r)
-    print(f"Просматриваю {len(by_digest)} текстовых файлов "
-          f"(они покрывают {len(text_rows)} появлений)...")
-
     emails, phones, socials = {}, {}, {}
     scanned = 0
+    scan_progress = {"processed": 0}
 
-    for digest, group in by_digest.items():
-        rep = group[0]
-        path = os.path.join(domain_dir, rep["store_path"])
-        if not os.path.isfile(path):
-            continue
-        try:
-            with open(path, "rb") as f:
-                text = decode_html(f.read())
-        except Exception:
-            continue
-        scanned += 1
-        # один и тот же контент мог встретиться на разных URL/датах -
-        # сканируем один раз, но находки относим ко ВСЕМ появлениям
-        sources = {f"{o['original_url']} @ {pretty_ts(o['timestamp'])}" for o in group}
-        local_emails, local_phones, local_socials = {}, {}, {}
-        scan_contacts_in_text(text, local_emails, local_phones, local_socials, "_")
+    def contact_scan_detail():
+        return (f"{scan_progress['processed']}/{len(by_digest)} unique content files | "
+                f"emails {len(emails)} | phone candidates {len(phones)} | social profiles {len(socials)}")
 
-        for v in local_emails:
-            emails.setdefault(v, set()).update(sources)
-        for v, d in local_phones.items():
-            entry = phones.setdefault(v, {"sources": set(), "confidence": d["confidence"]})
-            entry["sources"].update(sources)
-            if d["confidence"] == "высокая":
-                entry["confidence"] = "высокая"
-        for k in local_socials:
-            socials.setdefault(k, set()).update(sources)
+    with ConsoleStatus("Scanning text for contacts", detail_provider=contact_scan_detail):
+        for digest, group in by_digest.items():
+            scan_progress["processed"] += 1
+            rep = group[0]
+            path = os.path.join(domain_dir, rep["store_path"])
+            if not os.path.isfile(path):
+                continue
+            try:
+                text = decode_html(read_store_content(path, rep["original_url"], rep.get("mimetype", "")))
+            except Exception:
+                continue
+            scanned += 1
+            # один и тот же контент мог встретиться на разных URL/датах -
+            # сканируем один раз, но находки относим ко ВСЕМ появлениям
+            sources = {f"{o['original_url']} @ {pretty_ts(o['timestamp'])}" for o in group}
+            local_emails, local_phones, local_socials = {}, {}, {}
+            scan_contacts_in_text(text, local_emails, local_phones, local_socials, "_")
 
-    high_conf = {v: d for v, d in phones.items() if d["confidence"] == "высокая"}
-    low_conf = {v: d for v, d in phones.items() if d["confidence"] == "низкая"}
+            for v in local_emails:
+                emails.setdefault(v, set()).update(sources)
+            for v, d in local_phones.items():
+                entry = phones.setdefault(v, {"sources": set(), "confidence": d["confidence"]})
+                entry["sources"].update(sources)
+                if d["confidence"] == "high":
+                    entry["confidence"] = "high"
+            for k in local_socials:
+                socials.setdefault(k, set()).update(sources)
+
+    high_conf = {v: d for v, d in phones.items() if d["confidence"] == "high"}
+    low_conf = {v: d for v, d in phones.items() if d["confidence"] == "low"}
 
     reports_dir = os.path.join(domain_dir, DIR_REPORTS)
     os.makedirs(reports_dir, exist_ok=True)
 
-    csv_path = os.path.join(reports_dir, "контакты.csv")
+    csv_path = os.path.join(reports_dir, "contacts.csv")
     with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
-        w.writerow(["тип", "значение", "уверенность", "на_скольких_страницах", "пример_источника"])
+        w.writerow(["type", "value", "confidence", "page_count", "example_source"])
         for v, s in sorted(emails.items()):
-            w.writerow(["email", v, "высокая", len(s), sorted(s)[0]])
+            w.writerow(["email", v, "high", len(s), sorted(s)[0]])
         for v, d in sorted(phones.items()):
-            w.writerow(["телефон", "+" + v, d["confidence"], len(d["sources"]), sorted(d["sources"])[0]])
+            w.writerow(["phone", "+" + v, d["confidence"], len(d["sources"]), sorted(d["sources"])[0]])
         for (network, link), s in sorted(socials.items()):
-            w.writerow([f"соцсеть:{network}", link, "высокая", len(s), sorted(s)[0]])
+            w.writerow([f"social network:{network}", link, "high", len(s), sorted(s)[0]])
 
-    txt_path = os.path.join(reports_dir, "контакты.txt")
+    txt_path = os.path.join(reports_dir, "contacts.txt")
     with open(txt_path, "w", encoding="utf-8") as f:
-        f.write(f"КОНТАКТЫ ИЗ АРХИВА\nПросмотрено файлов: {scanned}\n")
+        f.write(f"CONTACTS FOUND IN ARCHIVE\nFiles scanned: {scanned}\n")
         f.write("=" * 78 + "\n\n")
         f.write(f"EMAIL ({len(emails)}):\n")
         for v, s in sorted(emails.items(), key=lambda kv: -len(kv[1])):
-            f.write(f"  {v}   (на {len(s)} стр.)\n")
+            f.write(f"  {v}   (on {len(s)} pages)\n")
 
-        f.write(f"\nТЕЛЕФОНЫ, НАДЁЖНО ({len(high_conf)}):\n")
+        f.write(f"\nPHONE NUMBERS — HIGH CONFIDENCE ({len(high_conf)}):\n")
         for v, d in sorted(high_conf.items(), key=lambda kv: -len(kv[1]["sources"])):
-            f.write(f"  +{v}   (на {len(d['sources'])} стр.)\n")
+            f.write(f"  +{v}   (on {len(d['sources'])} pages)\n")
 
         if low_conf:
-            f.write(f"\nПОХОЖЕ НА ТЕЛЕФОН, НО НЕ ТОЧНО ({len(low_conf)}):\n")
-            f.write("  (голые цифры без разделителей - могут оказаться ИНН, номером заказа и т.п.)\n")
+            f.write(f"\nPOSSIBLE PHONE NUMBERS — LOW CONFIDENCE ({len(low_conf)}):\n")
+            f.write("  (digits without separators may be tax IDs, order numbers, serial numbers, etc.)\n")
             for v, d in sorted(low_conf.items(), key=lambda kv: -len(kv[1]["sources"])):
-                f.write(f"  +{v}   (на {len(d['sources'])} стр.)\n")
+                f.write(f"  +{v}   (on {len(d['sources'])} pages)\n")
 
         by_network = {}
         for (network, link), s in socials.items():
             by_network.setdefault(network, []).append((link, len(s)))
-        f.write(f"\nСОЦСЕТИ И МЕССЕНДЖЕРЫ ({len(socials)}):\n")
+        f.write(f"\nSOCIAL NETWORKS AND MESSENGERS ({len(socials)}):\n")
         for network in sorted(by_network):
             f.write(f"\n  --- {network} ---\n")
             for link, count in sorted(by_network[network], key=lambda x: -x[1]):
-                f.write(f"  {link}   (на {count} стр.)\n")
+                f.write(f"  {link}   (on {count} pages)\n")
 
-    print(f"  контакты: email {len(emails)}, телефонов {len(high_conf)} "
-          f"(+{len(low_conf)} под вопросом), соцсетей {len(socials)}")
+    print(f"  Contacts: {len(emails)} emails | {len(high_conf)} high-confidence phone numbers "
+          f"(+{len(low_conf)} low-confidence) | {len(socials)} social profiles")
     return emails, phones, socials
 
 
@@ -3089,26 +3698,50 @@ def build_dashboard(domain, domain_dir, all_rows, stats):
     docs.sort(key=lambda r: r["timestamp"], reverse=True)
 
     e = html_mod.escape
+    deleted_metric = stats.get("deleted")
+    deleted_metric = "Unknown" if deleted_metric is None else str(deleted_metric)
     latest_dir = os.path.join(domain_dir, DIR_LATEST)
     latest_entry = find_dashboard_entry_index(latest_dir, domain)
 
+    # Only expose navigation targets that actually exist in this archive.
+    # For example, a PDF-only archive should not show a Photos link when no
+    # photo folder was created. Keep this logic local to dashboard rendering.
+    browse_links = []
+    if os.path.exists(latest_entry):
+        browse_links.append(("Latest site view", latest_entry))
+    for label, dirname in (
+        ("Documents", DIR_DOCS),
+        ("Photos", DIR_PHOTOS),
+        ("All versions", DIR_VERSIONS),
+    ):
+        target = os.path.join(domain_dir, dirname)
+        if os.path.isdir(target):
+            browse_links.append((label, target))
+    browse_section = ""
+    if browse_links:
+        browse_anchors = "\n".join(
+            f'<a class="big" href="{rel_link(reports_dir, target)}">{html_mod.escape(label)}</a>'
+            for label, target in browse_links
+        )
+        browse_section = f"<h2>Browse archive</h2>\n{browse_anchors}"
+
     reports_files = [
-        ("Таймлайн изменений", "таймлайн.txt"),
-        ("Встречено только один раз", "встречено_один_раз.txt"),
-        ("Граф ссылок", "граф_ссылок.txt"),
-        ("Контакты и соцсети", "контакты.txt"),
-        ("Контакты (таблица CSV)", "контакты.csv"),
-        ("Метаданные документов", "метаданные_документов.txt"),
-        ("Метаданные (таблица CSV)", "метаданные_документов.csv"),
-        ("EXIF фото (координаты и техника)", "exif.txt"),
-        ("EXIF (таблица CSV)", "exif.csv"),
-        ("Удалённые страницы", "удалённые_страницы.txt"),
-        ("Sitemap и robots.txt", "sitemap_и_robots.txt"),
+        ("Change timeline", "change_timeline.txt"),
+        ("Found only once", "single_capture_urls.txt"),
+        ("Link graph", "link_graph.txt"),
+        ("Contacts and social links", "contacts.txt"),
+        ("Contacts (CSV)", "contacts.csv"),
+        ("Document metadata", "document_metadata.txt"),
+        ("Document metadata (CSV)", "document_metadata.csv"),
+        ("Photo EXIF (GPS and camera details)", "photo_exif.txt"),
+        ("EXIF (CSV)", "photo_exif.csv"),
+        ("Removed pages", "removed_pages.txt"),
+        ("Sitemap and robots.txt", "sitemap_and_robots.txt"),
     ]
 
     parts = [f"""<!DOCTYPE html>
-<html lang="ru"><head><meta charset="utf-8">
-<title>Q2 — архив {e(domain)}</title>
+<html lang="en"><head><meta charset="utf-8">
+<title>Q2 — Archive: {e(domain)}</title>
 <style>
  body{{background:#111;color:#ddd;font-family:Consolas,monospace;margin:0;padding:24px}}
  h1{{color:#ff4444;border-bottom:2px solid #ff4444;padding-bottom:8px}}
@@ -3126,28 +3759,24 @@ def build_dashboard(domain, domain_dir, all_rows, stats):
        padding:12px 20px;margin:6px 8px 6px 0}}
  .muted{{color:#777;font-size:12px}}
 </style></head><body>
-<h1>Q2 — архив {e(domain)}</h1>
-<p class="muted">Собран: {datetime.now().strftime('%Y-%m-%d %H:%M')}</p>
+<h1>Q2 — Archive: {e(domain)}</h1>
+<p class="muted">Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}</p>
 
 <div class="cards">
-  <div class="card"><div class="num">{len(all_rows)}</div><div class="lbl">файлов всего</div></div>
-  <div class="card"><div class="num">{len(versions)}</div><div class="lbl">снимков сайта</div></div>
-  <div class="card"><div class="num">{len(docs)}</div><div class="lbl">документов</div></div>
-  <div class="card"><div class="num">{human_size(unique_storage_bytes)}</div><div class="lbl">объём на диске</div></div>
+  <div class="card"><div class="num">{len(all_rows)}</div><div class="lbl">capture records</div></div>
+  <div class="card"><div class="num">{len(versions)}</div><div class="lbl">capture timestamps</div></div>
+  <div class="card"><div class="num">{len(docs)}</div><div class="lbl">documents</div></div>
+  <div class="card"><div class="num">{human_size(unique_storage_bytes)}</div><div class="lbl">unique storage size</div></div>
   <div class="card"><div class="num">{stats.get('emails', 0)}</div><div class="lbl">email</div></div>
-  <div class="card"><div class="num">{stats.get('phones', 0)}</div><div class="lbl">телефонов</div></div>
-  <div class="card"><div class="num">{stats.get('people', 0)}</div><div class="lbl">имён в документах</div></div>
-  <div class="card"><div class="num">{stats.get('deleted', 0)}</div><div class="lbl">удалённых страниц</div></div>
-  <div class="card"><div class="num">{stats.get('gps_photos', 0)}</div><div class="lbl">фото с GPS</div></div>
+  <div class="card"><div class="num">{stats.get('phones', 0)}</div><div class="lbl">phone numbers</div></div>
+  <div class="card"><div class="num">{stats.get('people', 0)}</div><div class="lbl">names in documents</div></div>
+  <div class="card"><div class="num">{e(deleted_metric)}</div><div class="lbl">removed pages</div></div>
+  <div class="card"><div class="num">{stats.get('gps_photos', 0)}</div><div class="lbl">photos with GPS</div></div>
 </div>
 
-<h2>Открыть</h2>
-<a class="big" href="{rel_link(reports_dir, latest_entry)}">Свежая версия сайта</a>
-<a class="big" href="{rel_link(reports_dir, os.path.join(domain_dir, DIR_DOCS))}">Документы</a>
-<a class="big" href="{rel_link(reports_dir, os.path.join(domain_dir, DIR_PHOTOS))}">Фото</a>
-<a class="big" href="{rel_link(reports_dir, os.path.join(domain_dir, DIR_VERSIONS))}">Все версии</a>
+{browse_section}
 
-<h2>Отчёты</h2>
+<h2>Reports</h2>
 <ul>"""]
 
     for label, filename in reports_files:
@@ -3156,8 +3785,8 @@ def build_dashboard(domain, domain_dir, all_rows, stats):
             parts.append(f'<li><a href="{urllib.parse.quote(filename)}">{e(label)}</a></li>')
     parts.append("</ul>")
 
-    parts.append("<h2>Снимки сайта по датам</h2><table>"
-                  "<tr><th>Дата снимка</th><th>Файлов</th><th>Открыть</th></tr>")
+    parts.append("<h2>Site captures by date</h2><table>"
+                  "<tr><th>Capture date</th><th>Records</th><th>Open</th></tr>")
     count_by_version = {}
     for r in all_rows:
         count_by_version[folder_ts(r["timestamp"])] = \
@@ -3167,16 +3796,16 @@ def build_dashboard(domain, domain_dir, all_rows, stats):
         # в снимке может не быть главной страницы (например, попал только PDF) -
         # тогда ведём на саму папку, чтобы ссылка не была битой
         target = find_dashboard_entry_index(vdir, domain)
-        label = "открыть" if target != vdir else "папка"
+        label = "open" if target != vdir else "folder"
         parts.append(f'<tr><td>{e(v.replace("_", "  "))}</td>'
                      f'<td>{count_by_version.get(v, 0)}</td>'
                      f'<td><a href="{rel_link(reports_dir, target)}">{label}</a></td></tr>')
     parts.append("</table>")
     if len(versions) > 100:
-        parts.append(f'<p class="muted">показаны первые 100 из {len(versions)} снимков</p>')
+        parts.append(f'<p class="muted">showing the first 100 of {len(versions)} captures</p>')
 
-    parts.append("<h2>Документы</h2><table>"
-                  "<tr><th>Дата</th><th>Файл</th><th>Адрес на сайте</th></tr>")
+    parts.append("<h2>Documents</h2><table>"
+                  "<tr><th>Date</th><th>File</th><th>Original URL</th></tr>")
     for r in docs[:200]:
         ext = classify_doc_ext(r["original_url"], r.get("mimetype", ""))
         name = nice_filename(r["original_url"], r["timestamp"], r["digest"], forced_ext=ext)
@@ -3187,14 +3816,14 @@ def build_dashboard(domain, domain_dir, all_rows, stats):
                      f'<td class="muted">{e(r["original_url"][:80])}</td></tr>')
     parts.append("</table>")
     if len(docs) > 200:
-        parts.append(f'<p class="muted">показаны первые 200 из {len(docs)} документов</p>')
+        parts.append(f'<p class="muted">showing the first 200 of {len(docs)} documents</p>')
 
-    parts.append("<h2>Что внутри архива</h2><table><tr><th>Тип</th><th>Файлов</th></tr>")
+    parts.append("<h2>Archive contents</h2><table><tr><th>Type</th><th>Records</th></tr>")
     for ext, count in sorted(by_ext.items(), key=lambda kv: -kv[1])[:25]:
         parts.append(f"<tr><td>{e(ext)}</td><td>{count}</td></tr>")
     parts.append("</table></body></html>")
 
-    path = os.path.join(reports_dir, "ДАШБОРД.html")
+    path = os.path.join(reports_dir, "DASHBOARD.html")
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(parts))
     return path
@@ -3203,39 +3832,54 @@ def build_dashboard(domain, domain_dir, all_rows, stats):
 # ==================== РЕЖИМ: СКАЧАТЬ / ОБНОВИТЬ ====================
 
 def run_downloads(records, domain_dir, db_by_digest, total=None):
-    """Общий запуск скачивания через пул потоков - используется и для
-    основного скачивания, и для долавливания неудачных. При Ctrl+C сразу
-    выставляет SHUTDOWN: потоки, спящие в троттлинге/ретраях, просыпаются
-    за секунду вместо того, чтобы держать программу 'зависшей' до 10 минут
-    (см. interruptible_sleep)."""
+    """Run downloads with a live, truthful progress indicator on interactive terminals."""
     SHUTDOWN.clear()
     _clear_store_verify_cache()
     new_db_rows, failed_rows = [], []
     counters = {"done": 0, "reused": 0, "failed": 0}
     lock = threading.Lock()
     total = total if total is not None else len(records)
+    worker_errors = []
+
+    def progress_detail():
+        with lock:
+            done = counters["done"]
+            reused = counters["reused"]
+            failed = counters["failed"]
+        processed = min(total, done + reused + failed)
+        detail = f"{processed}/{total} processed | new {done} | reused {reused} | failed {failed}"
+        throttle_wait = THROTTLE.remaining()
+        service_wait = CIRCUIT_BREAKER.remaining()
+        if throttle_wait > 0:
+            detail = f"rate-limit cooldown ~{max(1, int(throttle_wait))}s | " + detail
+        elif service_wait > 0:
+            detail = f"service cooldown ~{max(1, int(service_wait))}s | " + detail
+        return detail
 
     ex = ThreadPoolExecutor(max_workers=MAX_WORKERS)
     try:
-        futures = [ex.submit(download_one, r, domain_dir, db_by_digest, new_db_rows,
-                             lock, counters, total, failed_rows) for r in records]
+        futures = {ex.submit(download_one, r, domain_dir, db_by_digest, new_db_rows,
+                             lock, counters, total, failed_rows) for r in records}
         try:
-            for future in as_completed(futures):
-                try:
-                    future.result()   # без этого исключение внутри потока тонет молча
-                except Exception as e:
-                    with lock:
-                        counters["failed"] += 1
-                    print(f"  [Неожиданная ошибка в потоке] {e}")
-                    LOGGER.error(f"Необработанное исключение в download_one: {e}\n"
-                                 f"{traceback.format_exc()}")
+            with ConsoleStatus("Downloading archive captures", detail_provider=progress_detail) as status:
+                while futures:
+                    completed, futures = wait(futures, timeout=0.35, return_when=FIRST_COMPLETED)
+                    for future in completed:
+                        try:
+                            future.result()
+                        except Exception as e:
+                            with lock:
+                                counters["failed"] += 1
+                            worker_errors.append(e)
+                            LOGGER.error(f"Unexpected download worker error: {e}\n{traceback.format_exc()}")
+                    status.update(progress_detail())
         except KeyboardInterrupt:
-            print("\n  Останавливаюсь (Ctrl+C), дожидаюсь текущих закачек...")
+            print("\nStopping (Ctrl+C); waiting for active downloads...")
             SHUTDOWN.set()
             try:
                 ex.shutdown(wait=True, cancel_futures=True)
             except TypeError:
-                ex.shutdown(wait=True)  # старый Python без cancel_futures
+                ex.shutdown(wait=True)
             raise
         else:
             ex.shutdown(wait=True)
@@ -3244,8 +3888,10 @@ def run_downloads(records, domain_dir, db_by_digest, total=None):
             append_db(domain_dir, new_db_rows)
         write_failed_csv(domain_dir, failed_rows)
 
+    for error in worker_errors:
+        print(f"  [Worker error] {error}")
+    print(f"  Download summary: new {counters['done']} | reused {counters['reused']} | failed {counters['failed']}")
     return counters, failed_rows, new_db_rows
-
 
 def retry_failed_first(domain_dir, db_by_digest):
     """Долов временных ошибок перед обычным CDX-обходом.
@@ -3266,13 +3912,13 @@ def retry_failed_first(domain_dir, db_by_digest):
     retry_rows = [r for r in rows if not failed_row_is_permanent(r)]
 
     if permanent_rows:
-        print(f"  Постоянных ошибок в очереди: {len(permanent_rows)} — автоматически не повторяю.")
+        print(f"  Permanent failures in queue: {len(permanent_rows)} — will not retry automatically.")
     if not retry_rows:
-        print("  Временных ошибок для долова нет.")
+        print("  No transient failures to retry.")
         return {**empty_stats, "permanent": len(permanent_rows)}
 
-    answer = input(f"\nВ прошлый раз не скачалось временно {len(retry_rows)} файлов. "
-                    f"Попробовать доловить сейчас? [Y/n]: ").strip().lower()
+    answer = input(f"\n{len(retry_rows)} files failed temporarily on the previous run. "
+                    f"Retry them now? [Y/n]: ").strip().lower()
     if answer == "n":
         return {**empty_stats, "permanent": len(permanent_rows), "attempted": 0}
 
@@ -3281,11 +3927,11 @@ def retry_failed_first(domain_dir, db_by_digest):
                 "statuscode": r.get("statuscode", ""), "length": r.get("length", "")}
                for r in retry_rows]
 
-    print("Доловливаю...")
+    print("Retrying failed downloads...")
     try:
         counters, failed_rows, _ = run_downloads(records, domain_dir, db_by_digest)
     except KeyboardInterrupt:
-        print("  Остановлено - уже скачанное сохранено, остальное осталось в очереди.")
+        print("  Stopped — completed downloads were saved; remaining items stay in the queue.")
         try:
             current_rows = []
             if os.path.isfile(path):
@@ -3293,7 +3939,7 @@ def retry_failed_first(domain_dir, db_by_digest):
                     current_rows = list(csv.DictReader(f))
             write_failed_csv(domain_dir, permanent_rows + current_rows)
         except Exception as e:
-            LOGGER.error(f"Не удалось восстановить очередь после Ctrl+C: {e}")
+            LOGGER.error(f"Could not restore the failure queue after Ctrl+C: {e}")
         return {**empty_stats, "permanent": len(permanent_rows), "attempted": len(retry_rows)}
 
     # run_downloads уже записал новые временные ошибки. Возвращаем в очередь
@@ -3302,9 +3948,9 @@ def retry_failed_first(domain_dir, db_by_digest):
     # их в CSV-строки; write_failed_csv также дедуплицирует очередь.
     combined = permanent_rows + failed_rows
     write_failed_csv(domain_dir, combined)
-    print(f"  доловлено: {counters['done']}, уже было: {counters['reused']}, "
-          f"всё ещё временно не вышло: {counters['failed']}, "
-          f"постоянных отложено: {len(permanent_rows)}")
+    print(f"  recovered: {counters['done']}, already available: {counters['reused']}, "
+          f"still failing temporarily: {counters['failed']}, "
+          f"permanent failures deferred: {len(permanent_rows)}")
     return {
         "done": counters.get("done", 0),
         "reused": counters.get("reused", 0),
@@ -3315,7 +3961,7 @@ def retry_failed_first(domain_dir, db_by_digest):
 
 
 def mode_download():
-    domain, domain_dir = ask_download_target()
+    domain, domain_dir, target_url = ask_download_target()
     if not domain_dir:
         return
 
@@ -3325,25 +3971,25 @@ def mode_download():
     db_by_digest, seen_occurrences, existing_rows = load_db(domain_dir)
     recovery_stats = {"done": 0, "reused": 0, "failed": 0, "permanent": 0, "attempted": 0}
     if existing_rows:
-        print(f"\nАрхив уже существует: {len(existing_rows)} записей в базе.")
-        print("Будет докачано новое, а отсутствующие/изменённые физические файлы — восстановлены.")
+        print(f"\nArchive already exists: {len(existing_rows)} database records.")
+        print("New captures will be downloaded; missing or modified local files will be restored.")
         recovery_stats = retry_failed_first(domain_dir, db_by_digest)
         if recovery_stats.get("attempted", 0):
-            # retry_failed_first уже изменил _база.csv. Перечитываем индексы,
+            # retry_failed_first уже изменил _database.csv. Перечитываем индексы,
             # иначе seen_occurrences остаётся состоянием ДО восстановления и
             # только что успешно доловленные capture повторно попадут в fresh.
             db_by_digest, seen_occurrences, existing_rows = load_db(domain_dir)
-            print(f"  Состояние БД обновлено после долова: {len(seen_occurrences)} появлений.")
+            print(f"  Database updated after recovery: {len(seen_occurrences)} captures.")
 
-    date_from = input("\nДата НАЧАЛА ГГГГММДД (Enter = с самого начала): ").strip()
-    date_to = input("Дата КОНЦА ГГГГММДД (Enter = по сегодня): ").strip()
-    include_raw = input("Какие типы файлов качать? Enter = все (html,pdf,jpg): ").strip().lower()
+    date_from = input("\nSTART DATE YYYYMMDD (Enter = earliest available): ").strip()
+    date_to = input("END DATE YYYYMMDD (Enter = through today): ").strip()
+    include_raw = input("File types to download? Enter = all (html,pdf,jpg): ").strip().lower()
     include_exts = {x.strip().lstrip(".") for x in include_raw.split(",") if x.strip()}
-    exclude_raw = input("Какие ИСКЛЮЧИТЬ? Enter = ничего (jpg,png,css): ").strip().lower()
+    exclude_raw = input("File types to EXCLUDE? Enter = none (jpg,png,css): ").strip().lower()
     exclude_exts = {x.strip().lstrip(".") for x in exclude_raw.split(",") if x.strip()}
 
     print()
-    records, _ = fetch_cdx_records(domain, date_from, date_to, domain_dir)
+    records, _ = fetch_cdx_records(domain, date_from, date_to, domain_dir, target_url=target_url)
     if not records:
         return
 
@@ -3352,52 +3998,60 @@ def mode_download():
         records = [r for r in records
                    if (not include_exts or classify_doc_ext(r["original"], r.get("mimetype", "")) in include_exts)
                    and (not exclude_exts or classify_doc_ext(r["original"], r.get("mimetype", "")) not in exclude_exts)]
-        print(f"После фильтра по типам: {len(records)} из {before}")
+        print(f"After file-type filtering: {len(records)} of {before}")
 
     failed_queue = failed_queue_rows(domain_dir)
     permanent_keys = permanent_failure_keys(failed_queue)
     fresh = []
     repair_count = 0
     permanent_skipped = 0
-    for r in records:
-        occurrence = (r["original"], r["timestamp"])
-        digest = normalize_store_digest(r["original"], r["timestamp"], r.get("digest", ""))
-        failure_key = (r["original"], r["timestamp"], str(r.get("digest", "")).strip().lower())
-        if failure_key in permanent_keys:
-            permanent_skipped += 1
-            continue
-        known = db_by_digest.get(digest)
-        store_file = store_path_for(domain_dir, digest)
-        valid = _verify_store_file(store_file, digest, known.get("sha256", "") if known else "")[0]
-        if occurrence not in seen_occurrences or not valid:
-            fresh.append(r)
-            if occurrence in seen_occurrences:
-                repair_count += 1
+    compare_stats = {"processed": 0}
+
+    def compare_detail():
+        return (f"{compare_stats['processed']}/{len(records)} records checked | "
+                f"to download/restore {len(fresh)} | permanent skipped {permanent_skipped}")
+
+    with ConsoleStatus("Comparing CDX results with local archive", detail_provider=compare_detail):
+        for r in records:
+            compare_stats["processed"] += 1
+            occurrence = (r["original"], r["timestamp"])
+            digest = normalize_store_digest(r["original"], r["timestamp"], r.get("digest", ""))
+            failure_key = (r["original"], r["timestamp"], str(r.get("digest", "")).strip().lower())
+            if failure_key in permanent_keys:
+                permanent_skipped += 1
+                continue
+            known = db_by_digest.get(digest)
+            store_file = store_path_for(domain_dir, digest)
+            valid = _verify_store_file(store_file, digest, known.get("sha256", "") if known else "")[0]
+            if occurrence not in seen_occurrences or not valid:
+                fresh.append(r)
+                if occurrence in seen_occurrences:
+                    repair_count += 1
     already = len(records) - len(fresh) - permanent_skipped
-    print(f"Состояние CDX: {len(records)} записей")
-    print(f"  есть и целы: {already} | новых/на восстановление: {len(fresh)} | permanent пропущено: {permanent_skipped}")
+    print(f"CDX results: {len(records)} records")
+    print(f"  valid existing: {already} | new/to restore: {len(fresh)} | permanent failures skipped: {permanent_skipped}")
     if repair_count:
-        print(f"  Из них повреждены/отсутствуют физически и будут перекачаны: {repair_count}")
+        print(f"  Missing or damaged physical files to restore: {repair_count}")
 
     if not fresh:
-        print("\nНичего нового — архив уже актуален.")
-        answer = input("Всё равно пересобрать папки и отчёты? [y/N]: ").strip().lower()
+        print("\nNothing new — the archive is up to date.")
+        answer = input("Rebuild folders and reports anyway? [y/N]: ").strip().lower()
         if answer != "y":
             return
 
     total_bytes = sum(int(r.get("length") or 0) for r in fresh
                       if str(r.get("length", "")).isdigit())
     if fresh:
-        print(f"\nК скачиванию: {len(fresh)} файлов, примерно {human_size(total_bytes)}")
-        if input("Качаем? [Y/n]: ").strip().lower() == "n":
+        print(f"\nQueued for download: {len(fresh)} files, approximately {human_size(total_bytes)}")
+        if input("Start downloading? [Y/n]: ").strip().lower() == "n":
             return
 
     new_db_rows, failed_rows = [], []
-    print(f"\nПапка архива: {domain_dir}")
+    print(f"\nArchive folder: {domain_dir}")
 
     failed_csv_path = os.path.join(domain_dir, FAILED_CSV)
     if fresh:
-        print(f"Скачиваю ({MAX_WORKERS} потока, общий интервал запросов {REQUEST_PACE_SECONDS:.1f} сек)...\n")
+        print(f"Downloading ({MAX_WORKERS} workers, global request interval {REQUEST_PACE_SECONDS:.1f}s)...\n")
         counters, failed_rows, new_db_rows = run_downloads(fresh, domain_dir, db_by_digest)
         # run_downloads записывает только ошибки этого прохода. Не теряем
         # существующие permanent-записи и не смешиваем их с новой очередью.
@@ -3410,7 +4064,7 @@ def mode_download():
         else:
             failed_path = failed_csv_path if failed_rows else None
     else:
-        print("Скачивать нечего, пересобираю папки и отчёты...")
+        print("Nothing to download; rebuilding folders and reports...")
         counters, failed_rows, new_db_rows = {"done": 0, "reused": 0, "failed": 0}, [], []
         failed_path = failed_csv_path if os.path.isfile(failed_csv_path) else None
 
@@ -3418,54 +4072,68 @@ def mode_download():
 
     _, _, all_rows = load_db(domain_dir)
 
-    print("\nРаскладываю по папкам...")
-    docs, photos = organize_by_type(domain_dir, all_rows)
-    latest_pairs = build_latest_site(domain_dir, all_rows)
-    print(f"  документов: {docs}, фото: {photos}, страниц в свежей версии: {len(latest_pairs)}")
+    print("\nPreparing offline archive...")
+    with ConsoleStatus("Organizing archive files", detail="documents and photos"):
+        docs, photos = organize_by_type(domain_dir, all_rows)
+    with ConsoleStatus("Building latest-site view", detail="linking captured pages"):
+        latest_pairs = build_latest_site(domain_dir, all_rows)
+    with ConsoleStatus("Normalizing derived files", detail="checking documents, latest site, and versions"):
+        normalized_views, normalization_failures = normalize_gzip_derived_views(domain_dir, all_rows)
+    if normalized_views or normalization_failures:
+        print(f"  GZIP-wrapped derived files normalized: {normalized_views} | failed: {normalization_failures}")
+    print(f"  Documents: {docs} | photos: {photos} | pages in latest view: {len(latest_pairs)}")
 
-    print("Делаю ссылки рабочими для офлайн-просмотра...")
-    changed, link_edges = rewrite_all_versions(domain_dir, all_rows, latest_pairs)
-    print(f"  переписано ссылок: {changed}")
+    with ConsoleStatus("Rewriting offline links", detail="processing captured HTML and CSS"):
+        changed, link_edges = rewrite_all_versions(domain_dir, all_rows, latest_pairs)
+    print(f"  Links rewritten: {changed}")
     report_link_graph(domain_dir, link_edges, all_rows)
 
-    deleted = report_deleted_pages(domain, domain_dir)
+    deleted = report_deleted_pages(domain, domain_dir, target_url=target_url)
 
-    print("\nСобираю отчёты...")
+    print("\nGenerating reports...")
     run_reports(domain, domain_dir, all_rows, deleted_count=len(deleted))
-    write_manifest(domain_dir, domain, date_from, date_to, include_exts, exclude_exts, all_rows)
+    write_manifest(domain_dir, domain, date_from, date_to, include_exts, exclude_exts,
+                   all_rows, target_url=target_url)
 
     print("\n" + "=" * 60)
     if recovery_stats.get("attempted", 0):
-        print(f"Восстановлено из очереди: {recovery_stats['done']}, "
-              f"переиспользовано: {recovery_stats['reused']}, "
-              f"временных ошибок осталось: {recovery_stats['failed']}, "
-              f"постоянных отложено: {recovery_stats['permanent']}")
-    print(f"Скачано в основном обновлении: {counters['done']}, "
-          f"переиспользовано: {counters['reused']}, "
-          f"ошибок: {counters['failed']}")
-    print(f"Архив: {domain_dir}")
-    print(f"Журнал: {log_path}")
+        print(f"Recovered from queue: {recovery_stats['done']}, "
+              f"reused: {recovery_stats['reused']}, "
+              f"transient failures remaining: {recovery_stats['failed']}, "
+              f"permanent failures deferred: {recovery_stats['permanent']}")
+    print(f"Downloaded in main update: {counters['done']}, "
+          f"reused: {counters['reused']}, "
+          f"failed: {counters['failed']}")
+    print(f"Archive: {domain_dir}")
+    print(f"Log: {log_path}")
     if failed_path:
         queue_now = failed_queue_rows(domain_dir)
         pending_t = sum(1 for r in queue_now if not failed_row_is_permanent(r))
         pending_p = sum(1 for r in queue_now if failed_row_is_permanent(r))
         if pending_t and pending_p:
-            print(f"\nВ очереди: временных {pending_t}, постоянных {pending_p}. Временные предложу доловить при следующем запуске.")
+            print(f"\nQueue: {pending_t} transient and {pending_p} permanent failures. Transient failures will be offered for retry on the next run.")
         elif pending_t:
-            print(f"\nНе скачалось временно: {pending_t} — при следующем запуске предложу доловить.")
+            print(f"\nTransient download failures: {pending_t} — retry will be offered on the next run.")
         elif pending_p:
-            print(f"\nПостоянных проблем отложено: {pending_p} — автоматически повторять не буду.")
+            print(f"\nPermanent failures deferred: {pending_p} — they will not be retried automatically.")
     print("=" * 60)
 
 
 # ==================== РЕЖИМ: ОТЧЁТЫ ====================
 
 def run_reports(domain, domain_dir, all_rows, deleted_count=0):
-    entries = report_timeline(domain_dir, all_rows)
+    with ConsoleStatus("Building change timeline", detail=f"{len(all_rows)} capture records"):
+        entries = report_timeline(domain_dir, all_rows)
+    once_count = sum(1 for entry in entries if entry["versions"] == 1)
+    print(f"  Timeline: {len(entries)} unique URLs | found only once: {once_count}")
+
     emails, phones, socials = report_contacts(domain_dir, all_rows)
     meta_results = report_document_metadata(domain_dir, all_rows)
     exif_results = report_exif(domain_dir, all_rows)
-    report_sitemap_robots(domain_dir, all_rows)
+    with ConsoleStatus("Analyzing sitemap and robots files", detail="captured standard paths"):
+        missing_sitemap_urls = report_sitemap_robots(domain_dir, all_rows)
+    if missing_sitemap_urls:
+        print(f"  Sitemap/robots: {len(missing_sitemap_urls)} discovered URLs are missing from the archive.")
 
     people = set()
     for meta in meta_results:
@@ -3478,9 +4146,10 @@ def run_reports(domain, domain_dir, all_rows, deleted_count=0):
     stats = {"emails": len(emails), "phones": len(phones), "socials": len(socials),
              "people": len(people), "deleted": deleted_count, "urls": len(entries),
              "gps_photos": gps_count}
-    dashboard = build_dashboard(domain, domain_dir, all_rows, stats)
-    print(f"\nДашборд: {dashboard}")
-    print("Открой его двойным кликом — оттуда виден весь архив.")
+    with ConsoleStatus("Rendering HTML dashboard", detail=f"{len(all_rows)} capture records"):
+        dashboard = build_dashboard(domain, domain_dir, all_rows, stats)
+    print(f"\nDashboard: {dashboard}")
+    print("Open it with a double-click to browse the entire archive.")
     return dashboard
 
 
@@ -3493,91 +4162,144 @@ def mode_reports():
     hide_store_folder(domain_dir)
     _, _, all_rows = load_db(domain_dir)
     if not all_rows:
-        print("База архива пуста — сначала скачайте сайт (пункт 01).")
+        print("The archive database is empty — download a website first (option 01).")
         return
     domain = domain_from_archive_db(domain_dir) or os.path.basename(domain_dir.rstrip(os.sep))
 
-    deleted_path = os.path.join(domain_dir, DIR_REPORTS, "удалённые_страницы.txt")
-    deleted_count = 0
+    reports_dir = os.path.join(domain_dir, DIR_REPORTS)
+    os.makedirs(reports_dir, exist_ok=True)
+    deleted_path = os.path.join(reports_dir, "removed_pages.txt")
+    deleted_count = None
     if os.path.isfile(deleted_path):
-        with open(deleted_path, encoding="utf-8") as f:
-            m = re.search(r"Найдено удалённых:\s*(\d+)", f.read())
+        try:
+            with open(deleted_path, encoding="utf-8") as f:
+                previous_deleted_report = f.read()
+            m = re.search(r"Removed pages found:\s*(\d+)", previous_deleted_report)
             if m:
                 deleted_count = int(m.group(1))
+            print("Removed-page report preserved from the last online archive update; option 02 does not query Wayback.")
+        except OSError as exc:
+            LOGGER.warning(f"Could not read previous removed-page report: {exc}")
+    else:
+        with open(deleted_path, "w", encoding="utf-8") as f:
+            f.write("REMOVED-PAGE ANALYSIS NOT AVAILABLE\n")
+            f.write("This report requires a Wayback CDX status-history query and cannot be refreshed offline.\n")
+            f.write("Run option 01 with network access to generate this report.\n")
+        print("Removed-page analysis is unknown; option 02 runs offline and did not query Wayback.")
 
-    print(f"\nАрхив: {domain_dir}\nФайлов в базе: {len(all_rows)}\n")
+    print(f"\nArchive: {domain_dir}\nDatabase records: {len(all_rows)}\n")
+    print("Rebuilding local link graph from canonical archived content...")
+    with ConsoleStatus("Building link graph", detail="reading stored HTML/CSS; no network requests"):
+        edges = build_link_graph_edges_from_store(domain_dir, all_rows)
+        report_link_graph(domain_dir, edges, all_rows)
     run_reports(domain, domain_dir, all_rows, deleted_count)
 
 
 # ==================== РЕЖИМ: ПРОВЕРКА ЦЕЛОСТНОСТИ ====================
 
+def _read_structure_sample(path, original_url="", mimetype=""):
+    """Return first bytes and last bytes of the represented content, decoding gzip wrappers."""
+    if not _gzip_payload_needs_decoding(path, original_url, mimetype):
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            head = f.read(16)
+            f.seek(max(0, size - 4096))
+            tail = f.read(4096)
+        return head, tail, None
+
+    head = b""
+    tail = b""
+    total = 0
+    try:
+        with gzip.open(path, "rb") as f:
+            head = f.read(16)
+            tail = head[-4096:]
+            total = len(head)
+            while True:
+                chunk = f.read(256 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_GZIP_INSPECTION_BYTES:
+                    return head, tail, "GZIP payload exceeds the structural-validation size limit"
+                tail = (tail + chunk)[-4096:]
+        return head, tail, None
+    except (OSError, EOFError, gzip.BadGzipFile, zlib.error) as e:
+        return head, tail, f"invalid GZIP payload: {e}"
+
+
 def inspect_file_structure(path, mimetype='', original_url=''):
-    """Консервативная sanity-проверка формата поверх SHA-256."""
+    """Conservative format sanity check, decoding gzip wrappers but not changing stored bytes."""
     ext = get_extension(original_url).lower()
     mime = (mimetype or '').split(';')[0].strip().lower()
     try:
         size = os.path.getsize(path)
         if size <= 0:
-            return 'BROKEN', 'пустой файл'
-        with open(path, 'rb') as f:
-            head = f.read(16)
-            f.seek(max(0, size - 4096))
-            tail = f.read(4096)
+            return 'BROKEN', 'empty file'
+        head, tail, sample_issue = _read_structure_sample(path, original_url, mimetype)
+        if sample_issue:
+            if sample_issue.startswith("GZIP payload exceeds"):
+                return 'WARNING', sample_issue
+            return 'BROKEN', sample_issue
 
         if ext == 'pdf' or mime == 'application/pdf' or head.startswith(b'%PDF-'):
             if not head.startswith(b'%PDF-'):
-                return 'BROKEN', 'нет сигнатуры %PDF-'
+                return 'BROKEN', 'missing %PDF- signature after content decoding'
             if b'%%EOF' not in tail:
-                return 'WARNING', 'в хвосте не найден %%EOF'
+                return 'WARNING', '%%EOF marker not found near end of file'
             if b'startxref' not in tail:
-                return 'WARNING', 'в хвосте не найден startxref'
+                return 'WARNING', 'startxref marker not found near end of file'
             return 'OK', ''
 
         if ext in {'jpg', 'jpeg'} or mime == 'image/jpeg':
             if not head.startswith(b'\xff\xd8'):
-                return 'BROKEN', 'нет JPEG SOI'
+                return 'BROKEN', 'missing JPEG SOI marker after content decoding'
             if not tail.endswith(b'\xff\xd9'):
-                return 'WARNING', 'нет JPEG EOI в самом конце'
+                return 'WARNING', 'JPEG EOI marker missing at end of file'
             return 'OK', ''
 
         if ext == 'png' or mime == 'image/png':
             if not head.startswith(b'\x89PNG\r\n\x1a\n'):
-                return 'BROKEN', 'нет PNG-сигнатуры'
+                return 'BROKEN', 'missing PNG signature after content decoding'
             if b'IEND' not in tail:
-                return 'WARNING', 'в хвосте не найден IEND'
+                return 'WARNING', 'IEND marker not found near end of file'
             return 'OK', ''
 
         if ext == 'gif' or mime == 'image/gif':
             if not (head.startswith(b'GIF87a') or head.startswith(b'GIF89a')):
-                return 'BROKEN', 'нет GIF-сигнатуры'
+                return 'BROKEN', 'missing GIF signature after content decoding'
             if not tail.endswith(b'\x3b'):
-                return 'WARNING', 'нет GIF trailer'
+                return 'WARNING', 'missing GIF trailer'
             return 'OK', ''
 
         if ext in {'tif', 'tiff'} or mime == 'image/tiff':
             if not (head.startswith(b'II*\x00') or head.startswith(b'MM\x00*')):
-                return 'BROKEN', 'нет TIFF-сигнатуры'
+                return 'BROKEN', 'missing TIFF signature after content decoding'
             return 'OK', ''
 
         if ext in {'zip', 'docx', 'xlsx', 'pptx', 'odt', 'ods', 'odp'} or mime == 'application/zip':
             try:
-                with zipfile.ZipFile(path) as zf:
-                    bad = zf.testzip()
-                return ('BROKEN', f'ошибка CRC ZIP: {bad}') if bad else ('OK', '')
+                if _gzip_payload_needs_decoding(path, original_url, mimetype):
+                    with gzip.open(path, 'rb') as decoded, zipfile.ZipFile(decoded) as zf:
+                        bad = zf.testzip()
+                else:
+                    with zipfile.ZipFile(path) as zf:
+                        bad = zf.testzip()
+                return ('BROKEN', f'ZIP CRC error: {bad}') if bad else ('OK', '')
             except zipfile.BadZipFile:
-                return 'BROKEN', 'битая ZIP-структура/central directory'
-            except OSError as e:
-                return 'WARNING', f'не удалось проверить ZIP: {e}'
+                return 'BROKEN', 'invalid ZIP structure/central directory'
+            except (OSError, EOFError, gzip.BadGzipFile, zlib.error) as e:
+                return 'WARNING', f'could not verify ZIP: {e}'
 
         if mime.startswith('text/html') or ext in HTML_EXTS:
             low = head.lower()
             if not any(x in low for x in (b'<html', b'<!doctype', b'<head', b'<body')):
-                return 'WARNING', 'HTML-сигнатура не обнаружена в начале файла'
+                return 'WARNING', 'HTML signature not found at start of file'
             return 'OK', ''
 
         return 'OK', ''
     except OSError as e:
-        return 'BROKEN', f'ошибка чтения: {e}'
+        return 'BROKEN', f'read error: {e}'
 
 
 def mode_verify():
@@ -3586,65 +4308,70 @@ def mode_verify():
         return
     _, _, all_rows = load_db(domain_dir)
     if not all_rows:
-        print('База архива пуста.')
+        print('The archive database is empty.')
         return
 
     occurrences = {}
     for r in all_rows:
         occurrences.setdefault(r['digest'], []).append(r)
     unique_rows = dedup_by_digest(all_rows)
-    print(f'Проверяю {len(unique_rows)} уникальных файлов (они покрывают {len(all_rows)} появлений в архиве)...')
+    print(f'Verifying {len(unique_rows)} unique files (covering {len(all_rows)} archive captures)...')
 
     ok = missing = mismatch = broken = warning = upstream_suspect = 0
     metadata_repairs = []
     problems = []
-    for r in unique_rows:
-        count = len(occurrences[r['digest']])
-        tail = f' (и ещё {count - 1} появлений этого же файла)' if count > 1 else ''
-        path = os.path.join(domain_dir, r['store_path'])
-        if not os.path.isfile(path):
-            missing += 1
-            problems.append(f'ОТСУТСТВУЕТ: {r["original_url"]} @ {r["timestamp"]}{tail}')
-            continue
-        expected_digest = str(r.get('digest', '')).strip()
-        expected_sha = str(r.get('sha256', '')).strip()
-        valid, sha, _ = _verify_store_file(path, expected_digest, expected_sha)
-        if not valid:
-            try:
-                actual_sha, _ = _sha256_and_size(path)
-            except OSError as e:
+    def verification_detail():
+        checked = ok + missing + mismatch + broken + warning
+        return (f"{checked}/{len(unique_rows)} files checked | OK {ok} | "
+                f"warnings {warning} | missing {missing} | modified {mismatch} | broken {broken}")
+
+    with ConsoleStatus("Verifying archive integrity", detail_provider=verification_detail):
+        for r in unique_rows:
+            count = len(occurrences[r['digest']])
+            tail = f' (plus {count - 1} more captures of this file)' if count > 1 else ''
+            path = os.path.join(domain_dir, r['store_path'])
+            if not os.path.isfile(path):
                 missing += 1
-                problems.append(f'НЕ ЧИТАЕТСЯ: {r["original_url"]} @ {r["timestamp"]}: {e}{tail}')
+                problems.append(f'MISSING: {r["original_url"]} @ {r["timestamp"]}{tail}')
                 continue
-            if expected_sha and actual_sha.lower() != expected_sha.lower():
-                mismatch += 1
-                problems.append(f'ИЗМЕНЁН: {r["original_url"]} @ {r["timestamp"]} (SHA-256 не совпал){tail}')
-            elif not expected_digest.startswith('local_'):
-                mismatch += 1
-                problems.append(f'ИЗМЕНЁН: {r["original_url"]} @ {r["timestamp"]} (Wayback SHA-1 digest не совпал){tail}')
+            expected_digest = str(r.get('digest', '')).strip()
+            expected_sha = str(r.get('sha256', '')).strip()
+            valid, sha, _ = _verify_store_file(path, expected_digest, expected_sha)
+            if not valid:
+                try:
+                    actual_sha, _ = _sha256_and_size(path)
+                except OSError as e:
+                    missing += 1
+                    problems.append(f'UNREADABLE: {r["original_url"]} @ {r["timestamp"]}: {e}{tail}')
+                    continue
+                if expected_sha and actual_sha.lower() != expected_sha.lower():
+                    mismatch += 1
+                    problems.append(f'MODIFIED: {r["original_url"]} @ {r["timestamp"]} (SHA-256 mismatch){tail}')
+                elif not expected_digest.startswith('local_'):
+                    mismatch += 1
+                    problems.append(f'MODIFIED: {r["original_url"]} @ {r["timestamp"]} (Wayback SHA-1 digest mismatch){tail}')
+                else:
+                    mismatch += 1
+                    problems.append(f'MODIFIED: {r["original_url"]} @ {r["timestamp"]} (checksum mismatch){tail}')
+                continue
+
+            # Если физический файл полностью подтверждён Wayback SHA-1, но в старой
+            # базе отсутствует SHA-256/размер, можно восстановить только метаданные —
+            # сеть для этого не нужна. Обновляем все появления этого digest ниже.
+            if (not expected_sha or not str(r.get('size_bytes', '')).isdigit() or
+                    int(r.get('size_bytes') or 0) <= 0):
+                metadata_repairs.append((expected_digest, sha, os.path.getsize(path)))
+
+            status, detail = inspect_file_structure(path, r.get('mimetype', ''), r.get('original_url', ''))
+            if status == 'BROKEN':
+                broken += 1
+                upstream_suspect += 1
+                problems.append(f'STRUCTURALLY BROKEN: {r["original_url"]} @ {r["timestamp"]}: {detail}{tail} | checksum matches; likely an issue with the snapshot/Wayback')
+            elif status == 'WARNING':
+                warning += 1
+                problems.append(f'WARNING: {r["original_url"]} @ {r["timestamp"]}: {detail}{tail}')
             else:
-                mismatch += 1
-                problems.append(f'ИЗМЕНЁН: {r["original_url"]} @ {r["timestamp"]} (контрольная сумма не совпала){tail}')
-            continue
-
-        # Если физический файл полностью подтверждён Wayback SHA-1, но в старой
-        # базе отсутствует SHA-256/размер, можно восстановить только метаданные —
-        # сеть для этого не нужна. Обновляем все появления этого digest ниже.
-        if (not expected_sha or not str(r.get('size_bytes', '')).isdigit() or
-                int(r.get('size_bytes') or 0) <= 0):
-            metadata_repairs.append((expected_digest, sha, os.path.getsize(path)))
-
-        status, detail = inspect_file_structure(path, r.get('mimetype', ''), r.get('original_url', ''))
-        if status == 'BROKEN':
-            broken += 1
-            upstream_suspect += 1
-            problems.append(f'СТРУКТУРНО БИТ: {r["original_url"]} @ {r["timestamp"]}: {detail}{tail} | SHA совпадает; вероятно, проблема самого snapshot/Wayback')
-        elif status == 'WARNING':
-            warning += 1
-            problems.append(f'ПРЕДУПРЕЖДЕНИЕ: {r["original_url"]} @ {r["timestamp"]}: {detail}{tail}')
-        else:
-            ok += 1
-
+                ok += 1
     if metadata_repairs:
         repair_by_digest = {d: (sha, size) for d, sha, size in metadata_repairs}
         repaired_rows = []
@@ -3662,23 +4389,23 @@ def mode_verify():
                 ])
         if repaired_rows:
             append_db(domain_dir, repaired_rows)
-            print(f"  Восстановлены метаданные БД без скачивания: {len(repaired_rows)} появлений.")
+            print(f"  Repaired database metadata without downloading: {len(repaired_rows)} captures.")
 
     reports_dir = os.path.join(domain_dir, DIR_REPORTS)
     os.makedirs(reports_dir, exist_ok=True)
-    path = os.path.join(reports_dir, 'проверка_целостности.txt')
+    path = os.path.join(reports_dir, 'integrity_check.txt')
     with open(path, 'w', encoding='utf-8') as f:
-        f.write(f'ПРОВЕРКА ЦЕЛОСТНОСТИ от {datetime.now().strftime("%Y-%m-%d %H:%M")}\n')
-        f.write(f'Всего появлений в базе: {len(all_rows)}, уникальных физических файлов: {len(unique_rows)}\n')
-        f.write(f'OK: {ok} | предупреждения: {warning} | структурно битые: {broken} | отсутствует: {missing} | SHA-256 изменён: {mismatch}\n')
-        f.write(f'Из структурно битых с совпавшими контрольными суммами: {upstream_suspect} — вероятно, проблема historical snapshot/Wayback\n')
-        f.write(f'Восстановлено метаданных БД без скачивания: {len(metadata_repairs)} физических файлов\n\n')
+        f.write(f'INTEGRITY CHECK — {datetime.now().strftime("%Y-%m-%d %H:%M")}\n')
+        f.write(f'Capture records in database: {len(all_rows)}, unique physical files: {len(unique_rows)}\n')
+        f.write(f'OK: {ok} | warnings: {warning} | structurally broken: {broken} | missing: {missing} | SHA-256 changed: {mismatch}\n')
+        f.write(f'Structurally broken despite matching checksums: {upstream_suspect} — likely an issue with the historical snapshot/Wayback\n')
+        f.write(f'Database metadata repaired without downloading: {len(metadata_repairs)} physical files\n\n')
         f.write('\n'.join(problems))
 
-    print(f'\nOK: {ok}, предупреждения: {warning}, структурно битые: {broken}, отсутствует: {missing}, SHA-256 изменён: {mismatch}')
+    print(f'\nOK: {ok}, warnings: {warning}, structurally broken: {broken}, missing: {missing}, SHA-256 changed: {mismatch}')
     if upstream_suspect:
-        print(f'  Из структурно битых с совпавшими контрольными суммами: {upstream_suspect} — вероятно проблема snapshot/Wayback')
-    print(f'Отчёт: {path}')
+        print(f'  Structurally broken despite matching checksums: {upstream_suspect} — likely a snapshot/Wayback issue')
+    print(f'Report: {path}')
 
 
 # ==================== ГЛАВНАЯ ====================
@@ -3687,7 +4414,7 @@ def main():
     os.makedirs(BASE_ARCHIVE_DIR, exist_ok=True)
     print_banner()
     print(RED + MENU + RESET)
-    choice = input("Выбор > ").strip().lstrip("0") or "1"
+    choice = input("Choice > ").strip().lstrip("0") or "1"
 
     if choice == "1":
         mode_download()
@@ -3698,19 +4425,19 @@ def main():
     elif choice == "4":
         return
     else:
-        print("Нет такого пункта.")
+        print("Invalid option.")
 
-    input("\nНажмите Enter для выхода...")
+    input("\nPress Enter to exit...")
 
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\nОстановлено пользователем.")
+        print("\nStopped by user.")
     except Exception:
-        print("\nПроизошла непредвиденная ошибка:")
+        print("\nAn unexpected error occurred:")
         traceback.print_exc()
-        input("\nНажмите Enter для выхода...")
+        input("\nPress Enter to exit...")
 
 
