@@ -2,7 +2,8 @@
 
 > **Q2** is a personal OSINT tool for downloading, preserving, and inspecting historical website captures from the Internet Archive's Wayback Machine. It discovers captures through the CDX API, verifies downloaded bytes, stores unique originals in a canonical local store, and builds an offline archive with dated versions, documents, photos, reports, and an HTML dashboard.
 
-<img width="597" height="301" alt="Q2 terminal interface" src="https://github.com/user-attachments/assets/316766cb-55ed-4b89-af94-769f60398e34" />
+<img width="572" height="289" alt="изображение" src="https://github.com/user-attachments/assets/5631af4b-14be-41f7-8f07-1e25df8b69aa" />
+
 
 ## Features
 
